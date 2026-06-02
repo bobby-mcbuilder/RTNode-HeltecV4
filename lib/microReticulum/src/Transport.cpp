@@ -116,7 +116,12 @@ static bool is_backbone_interface(const Interface& iface) {
 
 #ifdef FIREWALL_MODE
 static bool is_boundary_trusted_interface(const Interface& iface) {
-	return Transport::is_local_client_interface(iface);
+	// In boundary mode, backbone interfaces are WAN/untrusted ingress.
+	// All non-backbone ingress (LoRa, on-device/local interfaces) is local/trusted.
+	if (is_backbone_interface(iface)) {
+		return false;
+	}
+	return true;
 }
 
 static bool is_boundary_untrusted_interface(const Interface& iface) {
@@ -1496,26 +1501,33 @@ static bool is_boundary_address_packet(const Packet& packet) {
 		{
 			bool is_untrusted_ingress = is_boundary_untrusted_interface(packet.receiving_interface());
 			bool is_announce = packet.packet_type() == Type::Packet::ANNOUNCE;
+			bool is_backbone_ingress = is_backbone_interface(packet.receiving_interface());
 			if (is_untrusted_ingress) {
 				if (is_announce) {
-					// Real Reticulum destinations answer path requests with a
-					// PATH_RESPONSE announce using the normal announce packet
-					// header shape. Only transport-rebroadcasted responses carry
-					// HEADER_2 and our transport identity. Treat any matching
-					// PATH_RESPONSE for an outstanding discovery request as solicited.
-					bool solicited_path_response = packet.context() == Type::Packet::PATH_RESPONSE
-						&& _discovery_path_requests.find(packet.destination_hash()) != _discovery_path_requests.end();
+					if (is_backbone_ingress) {
+						// Real Reticulum destinations answer path requests with a
+						// PATH_RESPONSE announce using the normal announce packet
+						// header shape. Only transport-rebroadcasted responses carry
+						// HEADER_2 and our transport identity. Treat any matching
+						// PATH_RESPONSE for an outstanding discovery request as solicited.
+						bool solicited_path_response = packet.context() == Type::Packet::PATH_RESPONSE
+							&& _discovery_path_requests.find(packet.destination_hash()) != _discovery_path_requests.end();
 
-					if (!solicited_path_response) {
-						DEBUG("BOUNDARY: BLOCKED unsolicited backbone announce dest=" + packet.destination_hash().toHex().substr(0,8) + " ctx=" + std::to_string(packet.context()) + " hdr=" + std::to_string(packet.header_type()));
-						return;
+						if (!solicited_path_response) {
+							DEBUG("BOUNDARY: BLOCKED unsolicited backbone announce dest=" + packet.destination_hash().toHex().substr(0,8) + " ctx=" + std::to_string(packet.context()) + " hdr=" + std::to_string(packet.header_type()));
+							return;
+						}
 					}
 				}
 
 				// === UNTRUSTED PACKET: gate against all whitelists ===
 				bool allowed = false;
+				// LoRa/native RF announces must be accepted so path table can form.
+				if (is_announce && !is_backbone_ingress) {
+					allowed = true;
+				}
 				// Whitelist 1: destination is a local device
-				if (_boundary_local_addresses.find(packet.destination_hash()) != _boundary_local_addresses.end()) {
+				else if (_boundary_local_addresses.find(packet.destination_hash()) != _boundary_local_addresses.end()) {
 					allowed = true;
 				}
 				// Whitelist 2: destination was mentioned by a local device

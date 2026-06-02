@@ -219,27 +219,36 @@ static void config_send_html() {
 
     // ── TCP Backbone Section ──
     html += F(
-        "<h2>&#x1f310; TCP Backbone</h2>"
-        "<label>Mode</label>"
-        "<select name='tcp_mode'>"
+        "<h2>&#x1f310; TCP Backbones</h2>"
+        "<p class='note'>Configure up to four independent TCP backbone uplinks. "
+        "Each enabled slot becomes its own boundary interface. Leave host blank to disable a slot.</p>"
     );
-    html += F("<option value='0'");
-    if (firewall_state.tcp_mode == 0) html += F(" selected");
-    html += F(">Disabled</option>");
-    html += F("<option value='1'");
-    if (firewall_state.tcp_mode == 1) html += F(" selected");
-    html += F(">Client (connect to backbone)</option>");
-    html += F("</select>");
+    for (size_t slot = 0; slot < FIREWALL_BACKBONE_SLOTS; slot++) {
+        html += F("<div class='card'>");
+        html += F("<label>");
+        html += String("Backbone ") + String((int)slot + 1);
+        html += F("</label>");
 
-    html += F("<label>Backbone Host</label>");
-    html += F("<input name='bb_host' maxlength='63' placeholder='e.g. 192.168.1.100' value='");
-    html += String(firewall_state.backbone_host);
-    html += F("'>");
+        html += F("<select name='");
+        html += String("bb") + String((int)slot) + F("_en'>");
+        html += F("<option value='0'");
+        if (!firewall_state.backbones[slot].enabled) html += F(" selected");
+        html += F(">Disabled</option>");
+        html += F("<option value='1'");
+        if (firewall_state.backbones[slot].enabled) html += F(" selected");
+        html += F(">Enabled</option></select>");
 
-    html += F("<label>Backbone Port</label>");
-    html += F("<input name='bb_port' type='number' min='1' max='65535' value='");
-    html += String(firewall_state.backbone_port);
-    html += F("'>");
+        html += F("<label>Host</label><input name='");
+        html += String("bb") + String((int)slot) + F("_host' maxlength='63' placeholder='e.g. rns.example.net' value='");
+        html += String(firewall_state.backbones[slot].host);
+        html += F("'>");
+
+        html += F("<label>Port</label><input name='");
+        html += String("bb") + String((int)slot) + F("_port' type='number' min='1' max='65535' value='");
+        html += String(firewall_state.backbones[slot].port);
+        html += F("'>");
+        html += F("</div>");
+    }
 
     // ── Local TCP Server Section ──
     html += F(
@@ -560,17 +569,25 @@ static void config_handle_save() {
     eeprom_update(eeprom_addr(ADDR_CONF_DROT), (uint8_t)display_rotation);
 
     // ── TCP backbone settings ──
-    firewall_state.tcp_mode = (uint8_t)config_server->arg("tcp_mode").toInt(); // 0=disabled, 1=client
-    if (firewall_state.tcp_mode > 1) firewall_state.tcp_mode = 0;
-    firewall_state.tcp_port = (uint16_t)config_server->arg("tcp_port").toInt();
-    if (firewall_state.tcp_port == 0) firewall_state.tcp_port = 4242;
+    for (size_t slot = 0; slot < FIREWALL_BACKBONE_SLOTS; slot++) {
+        String en_arg = String("bb") + String((int)slot) + String("_en");
+        String host_arg_name = String("bb") + String((int)slot) + String("_host");
+        String port_arg_name = String("bb") + String((int)slot) + String("_port");
 
-    String bb_host = config_server->arg("bb_host");
-    memset(firewall_state.backbone_host, 0, sizeof(firewall_state.backbone_host));
-    strncpy(firewall_state.backbone_host, bb_host.c_str(), sizeof(firewall_state.backbone_host) - 1);
+        firewall_state.backbones[slot].enabled = (config_server->arg(en_arg).toInt() == 1);
 
-    firewall_state.backbone_port = (uint16_t)config_server->arg("bb_port").toInt();
-    if (firewall_state.backbone_port == 0) firewall_state.backbone_port = 4242;
+        String bb_host = config_server->arg(host_arg_name);
+        bb_host.trim();
+        memset(firewall_state.backbones[slot].host, 0, sizeof(firewall_state.backbones[slot].host));
+        strncpy(firewall_state.backbones[slot].host, bb_host.c_str(), sizeof(firewall_state.backbones[slot].host) - 1);
+
+        firewall_state.backbones[slot].port = (uint16_t)config_server->arg(port_arg_name).toInt();
+        if (firewall_state.backbones[slot].port == 0) firewall_state.backbones[slot].port = 4242;
+
+        if (firewall_state.backbones[slot].host[0] == '\0') {
+            firewall_state.backbones[slot].enabled = false;
+        }
+    }
 
     // ── Local TCP server settings ──
     firewall_state.ap_tcp_enabled = (config_server->arg("ap_tcp_en").toInt() == 1);
@@ -839,14 +856,24 @@ void config_portal_start() {
     if (disp_ready) {
         // Show config mode on display
         stat_area.fillScreen(SSD1306_BLACK);
-        stat_area.setCursor(0, 0);
-        stat_area.println("CONFIG MODE");
-        stat_area.println("");
-        stat_area.println("Connect to:");
-        stat_area.println(CONFIG_AP_SSID);
-        stat_area.println("");
-        stat_area.println("Open browser");
-        stat_area.println("http://10.0.0.1");
+        stat_area.setTextColor(SSD1306_WHITE);
+        stat_area.setTextSize(1);
+        stat_area.setTextWrap(false);
+
+        stat_area.setCursor((64 - (6 * 6)) / 2, 0);
+        stat_area.print("CONFIG");
+        stat_area.setCursor((64 - (4 * 6)) / 2, 8);
+        stat_area.print("MODE");
+
+        stat_area.setCursor((64 - (10 * 6)) / 2, 24);
+        stat_area.print("Connect to");
+        stat_area.setCursor((64 - (10 * 6)) / 2, 32);
+        stat_area.print("Wifi SSID:");
+        stat_area.setCursor((64 - (7 * 6)) / 2, 40);
+        stat_area.print("RTNode-");
+        stat_area.setCursor((64 - (5 * 6)) / 2, 48);
+        stat_area.print("Setup");
+
         display.clearDisplay();
         display.drawBitmap(0, 0, stat_area.getBuffer(), stat_area.width(), stat_area.height(), SSD1306_WHITE, SSD1306_BLACK);
         display.display();

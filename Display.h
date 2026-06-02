@@ -806,18 +806,20 @@ void draw_stat_area() {
     }
 
     // Row 3 — WAN / backbone TCP
-    if (firewall_state.tcp_mode == 0) {
+    size_t wan_enabled = firewall_backbone_enabled_count();
+    size_t wan_connected = firewall_backbone_connected_count();
+    if (wan_enabled == 0) {
       stat_area.drawCircle(4, 23, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 26);
-      stat_area.print("wan");
-    } else if (firewall_state.tcp_connected) {
+      stat_area.printf("WAN:0/4");
+    } else if (wan_connected > 0) {
       stat_area.fillCircle(4, 23, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 26);
-      stat_area.print("WAN");
+      stat_area.printf("WAN:%u/4", (unsigned)wan_connected);
     } else {
       stat_area.drawCircle(4, 23, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 26);
-      stat_area.print("wan");
+      stat_area.printf("WAN:%u/4", (unsigned)wan_connected);
     }
 
     // Row 4 — LAN / local TCP server (hidden when disabled)
@@ -904,7 +906,15 @@ void draw_disp_area() {
       p_by = 18;
       disp_area.fillRect(0, 0, disp_area.width(), disp_area.height(), SSD1306_BLACK);
     }
-    if (!device_init_done) disp_area.drawBitmap(0, p_by, bm_boot, disp_area.width(), 27, SSD1306_WHITE, SSD1306_BLACK);
+    if (!device_init_done) {
+      disp_area.drawBitmap(0, p_by, bm_boot, disp_area.width(), 27, SSD1306_WHITE, SSD1306_BLACK);
+      disp_area.setFont(SMALL_FONT);
+      disp_area.setTextWrap(false);
+      disp_area.setTextColor(SSD1306_WHITE);
+      disp_area.setTextSize(1);
+      disp_area.setCursor(2, 8);
+      disp_area.printf("v%u.%u", (unsigned)MAJ_VERS, (unsigned)MIN_VERS);
+    }
     if (firmware_update_mode) disp_area.drawBitmap(0, p_by, bm_fw_update, disp_area.width(), 27, SSD1306_WHITE, SSD1306_BLACK);
   } else {
     if (!disp_ext_fb or bt_ssp_pin != 0) {
@@ -928,23 +938,28 @@ void draw_disp_area() {
       disp_area.setTextColor(SSD1306_WHITE);
 
       // Radio info
-      disp_area.setCursor(2, 18);
+      disp_area.setCursor(3, 16);
       if (radio_online) {
-        disp_area.printf("%.3fMHz", (float)lora_freq / 1000000.0);
+        disp_area.printf("%.3f MHz", (float)lora_freq / 1000000.0);
       } else {
         disp_area.print("Radio OFF");
       }
 
-      disp_area.setCursor(2, 29);
+      disp_area.setCursor(3, 25);
       if (radio_online) {
-        disp_area.printf("SF%d %.0fk", lora_sf, (float)lora_bw / 1000.0);
+        disp_area.printf("SF:%d %.0fk", lora_sf, (float)lora_bw / 1000.0);
       }
 
-      // 1px separator after SF line
-      disp_area.drawLine(0, 34, disp_area.width()-1, 34, SSD1306_WHITE);
+      disp_area.setCursor(3, 34);
+      if (radio_online) {
+        disp_area.printf("CR:4/%d", lora_cr);
+      }
+
+      // 1px separator after radio info
+      disp_area.drawLine(0, 40, disp_area.width()-1, 40, SSD1306_WHITE);
 
       // IP address
-      disp_area.setCursor(2, 44);
+      disp_area.setCursor(3, 49);
       if (firewall_state.wifi_connected) {
         disp_area.print(wr_device_ip);
       } else {
@@ -957,7 +972,8 @@ void draw_disp_area() {
         disp_area.printf("Port:%u", firewall_state.ap_tcp_port);
       }
 
-      disp_area.drawLine(0, 60, disp_area.width()-1, 60, SSD1306_WHITE);
+      // Bottom divider (maps to y=127 at 2x display scale)
+      disp_area.drawLine(0, 63, disp_area.width()-1, 63, SSD1306_WHITE);
 #else
       if (radio_online && display_diagnostics) {
 #ifdef HAS_RNS

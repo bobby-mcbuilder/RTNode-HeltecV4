@@ -263,8 +263,13 @@ RNS::FileSystem filesystem(RNS::Type::NONE);
 #ifdef FIREWALL_MODE
 // Firewall mode: TCP backbone interface + state
 FirewallState firewall_state = {};
-RNS::Interface tcp_rns_interface(RNS::Type::NONE);
-TcpInterface*  tcp_interface_ptr = nullptr;
+RNS::Interface tcp_rns_interfaces[FIREWALL_BACKBONE_SLOTS] = {
+  RNS::Interface(RNS::Type::NONE),
+  RNS::Interface(RNS::Type::NONE),
+  RNS::Interface(RNS::Type::NONE),
+  RNS::Interface(RNS::Type::NONE)
+};
+TcpInterface*  tcp_interface_ptrs[FIREWALL_BACKBONE_SLOTS] = { nullptr, nullptr, nullptr, nullptr };
 // Local TCP server
 RNS::Interface local_tcp_rns_interface(RNS::Type::NONE);
 TcpInterface*  local_tcp_interface_ptr = nullptr;
@@ -861,27 +866,46 @@ void setup() {
         HEAD("Firewall Mode: WiFi DISABLED (LoRa-only repeater)", RNS::LOG_TRACE);
       }
 
-      // Register TCP backbone interface if enabled (mode 1 = client)
-      if (firewall_state.wifi_enabled && firewall_state.tcp_mode == 1) {
-        tcp_interface_ptr = new TcpInterface(
-            TCP_IF_MODE_CLIENT,
-            firewall_state.tcp_port,
-            firewall_state.backbone_host,
-            firewall_state.backbone_port
-        );
-        tcp_rns_interface = tcp_interface_ptr;
-        tcp_rns_interface.mode(RNS::Type::Interface::MODE_BOUNDARY);
-        tcp_rns_interface.is_backbone(true);
-        RNS::Transport::register_interface(tcp_rns_interface);
+      // Register configured TCP backbone interfaces.
+      size_t configured_backbones = 0;
+      if (firewall_state.wifi_enabled) {
+        for (size_t slot = 0; slot < FIREWALL_BACKBONE_SLOTS; slot++) {
+          FirewallBackboneSlot& backbone = firewall_state.backbones[slot];
+          if (!backbone.enabled) {
+            continue;
+          }
+          if (backbone.host[0] == '\0') {
+            char _bm_msg[96];
+            snprintf(_bm_msg, sizeof(_bm_msg), "Backbone %u enabled without host; skipping", (unsigned)(slot + 1));
+            HEAD(_bm_msg, RNS::LOG_WARNING);
+            backbone.enabled = false;
+            continue;
+          }
 
-        {
+          char iface_name[24];
+          snprintf(iface_name, sizeof(iface_name), "BackboneInterface%u", (unsigned)(slot + 1));
+          tcp_interface_ptrs[slot] = new TcpInterface(
+              TCP_IF_MODE_CLIENT,
+              backbone.port,
+              backbone.host,
+              backbone.port,
+              iface_name
+          );
+          tcp_rns_interfaces[slot] = tcp_interface_ptrs[slot];
+          tcp_rns_interfaces[slot].mode(RNS::Type::Interface::MODE_BOUNDARY);
+          tcp_rns_interfaces[slot].is_backbone(true);
+          RNS::Transport::register_interface(tcp_rns_interfaces[slot]);
+          configured_backbones++;
+
           char _bm_msg[128];
-          snprintf(_bm_msg, sizeof(_bm_msg), "TCP backbone: client -> %s:%d",
-                   firewall_state.backbone_host, firewall_state.backbone_port);
+          snprintf(_bm_msg, sizeof(_bm_msg), "TCP backbone %u: client -> %s:%d",
+                   (unsigned)(slot + 1), backbone.host, backbone.port);
           HEAD(_bm_msg, RNS::LOG_TRACE);
         }
-      } else if (firewall_state.tcp_mode == 0) {
-        HEAD("Firewall Mode: TCP backbone DISABLED", RNS::LOG_TRACE);
+      }
+
+      if (configured_backbones == 0) {
+        HEAD("Firewall Mode: TCP backbones DISABLED", RNS::LOG_TRACE);
       }
 
       // Register local TCP server if enabled
@@ -931,9 +955,13 @@ void setup() {
 #ifdef FIREWALL_MODE
       // Start TCP interfaces after Reticulum is running
       if (firewall_state.wifi_enabled && (wifi_is_connected() || wifi_mode == WR_WIFI_AP)) {
-        if (tcp_interface_ptr) {
-          tcp_interface_ptr->start();
-          HEAD("Firewall Mode: TCP backbone started", RNS::LOG_TRACE);
+        for (size_t slot = 0; slot < FIREWALL_BACKBONE_SLOTS; slot++) {
+          if (tcp_interface_ptrs[slot]) {
+            tcp_interface_ptrs[slot]->start();
+          }
+        }
+        if (firewall_any_backbone_enabled()) {
+          HEAD("Firewall Mode: TCP backbones started", RNS::LOG_TRACE);
         }
         if (local_tcp_interface_ptr) {
           local_tcp_interface_ptr->start();
@@ -995,12 +1023,12 @@ void setup() {
       HEAD("LoRa Interface: MODE_GATEWAY", RNS::LOG_TRACE);
       {
         char _bm_info[128];
-        if (firewall_state.tcp_mode == 1) {
-          snprintf(_bm_info, sizeof(_bm_info), "TCP Backbone: client -> %s:%d",
-                   firewall_state.backbone_host, firewall_state.backbone_port);
+        if (firewall_any_backbone_enabled()) {
+          snprintf(_bm_info, sizeof(_bm_info), "TCP Backbones: %u configured",
+                   (unsigned)firewall_backbone_enabled_count());
           HEAD(_bm_info, RNS::LOG_TRACE);
         } else {
-          HEAD("TCP Backbone: DISABLED", RNS::LOG_TRACE);
+          HEAD("TCP Backbones: DISABLED", RNS::LOG_TRACE);
         }
         if (firewall_state.ap_tcp_enabled) {
           snprintf(_bm_info, sizeof(_bm_info), "Local TCP Server: port %d (MODE_GATEWAY)",
@@ -2589,22 +2617,31 @@ void loop() {
   if (firewall_state.wifi_enabled) {
     // Start TCP interfaces if WiFi just connected and not yet started
     if (wifi_is_connected()) {
-      if (tcp_interface_ptr && !tcp_interface_ptr->isStarted()) {
-        tcp_interface_ptr->start();
-        Serial.println("[Firewall] WiFi connected, TCP backbone started");
+      bool started_backbone = false;
+      for (size_t slot = 0; slot < FIREWALL_BACKBONE_SLOTS; slot++) {
+        if (tcp_interface_ptrs[slot] && !tcp_interface_ptrs[slot]->isStarted()) {
+          tcp_interface_ptrs[slot]->start();
+          started_backbone = true;
+        }
+      }
+      if (started_backbone) {
+        Serial.println("[Firewall] WiFi connected, TCP backbones started");
       }
       if (local_tcp_interface_ptr && !local_tcp_interface_ptr->isStarted()) {
         local_tcp_interface_ptr->start();
         Serial.println("[Firewall] WiFi connected, local TCP server started");
       }
     }
-    if (tcp_interface_ptr) {
-      tcp_interface_ptr->loop();
+    for (size_t slot = 0; slot < FIREWALL_BACKBONE_SLOTS; slot++) {
+      firewall_state.backbones[slot].connected = false;
+      if (tcp_interface_ptrs[slot]) {
+        tcp_interface_ptrs[slot]->loop();
+        firewall_state.backbones[slot].connected = tcp_interface_ptrs[slot]->isConnected();
+      }
     }
     if (local_tcp_interface_ptr) {
       local_tcp_interface_ptr->loop();
     }
-    firewall_state.tcp_connected    = (tcp_interface_ptr && tcp_interface_ptr->isConnected());
     firewall_state.ap_tcp_connected  = (local_tcp_interface_ptr && local_tcp_interface_ptr->isConnected());
     firewall_state.wifi_connected    = wifi_is_connected();
   }

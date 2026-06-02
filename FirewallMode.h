@@ -21,10 +21,11 @@
 //   - WAN→LAN traffic is filtered unless a LAN device has "punched a hole"
 //     by referencing the source or a LAN device has been referenced first.
 //
-// The boundary node operates with TWO RNS interfaces:
+// The boundary node operates with a LoRa mesh interface plus up to four
+// TCP backbone client interfaces:
 //
 //   1. LoRaInterface (MODE_GATEWAY) — radio side, handles LoRa mesh
-//   2. BackboneInterface (MODE_BOUNDARY) — WiFi side, connects to TCP backbone
+//   2. BackboneInterface[1-4] (MODE_BOUNDARY) — WiFi side TCP uplinks
 //
 // RNS Transport is ALWAYS enabled in firewall mode.
 // Packets received on either interface are routed through Transport
@@ -52,6 +53,10 @@
 #ifndef FIREWALL_TCP_PORT
 #define FIREWALL_TCP_PORT 4242
 #endif
+
+#define FIREWALL_BACKBONE_SLOTS 4
+#define FIREWALL_BACKBONE_HOST_LEN 64
+#define FIREWALL_BACKBONE_SLOT_BYTES (1 + FIREWALL_BACKBONE_HOST_LEN + 2)
 
 // ─── EEPROM Extension Addresses ──────────────────────────────────────────────
 // We use the CONFIG area (config_addr) for additional firewall mode settings.
@@ -100,8 +105,13 @@
 #define ADDR_CONF_LT_AL         0x150 // Long-term  airtime limit (1 byte, percent * 10)
 #define ADDR_CONF_MDNS_EN       0x151 // mDNS enable flag (1 byte; 0x73 = enabled, 0xFF = unset/default-enabled)
 #define ADDR_CONF_MDNS_NAME     0x152 // Custom mDNS hostname (33 bytes, null-terminated; empty = auto)
-// Total: 0x173 (371 bytes — extends beyond 256-byte CONFIG area into
-//         unused EEPROM gap; safe on ESP32 where EEPROM starts at 824)
+// Extra backbone slots 1-3 (slot 0 remains in the legacy BTCP/BHOST/BHPORT
+// fields for backward compatibility with existing devices).
+#define ADDR_CONF_BSLOT_BASE    0x173
+#define ADDR_CONF_BSLOT_EN(slot)   (ADDR_CONF_BSLOT_BASE + ((slot) - 1) * FIREWALL_BACKBONE_SLOT_BYTES)
+#define ADDR_CONF_BSLOT_HOST(slot) (ADDR_CONF_BSLOT_EN(slot) + 1)
+#define ADDR_CONF_BSLOT_PORT(slot) (ADDR_CONF_BSLOT_HOST(slot) + FIREWALL_BACKBONE_HOST_LEN)
+// Total: 0x23C (572 bytes — still within the extended CONFIG area used on ESP32)
 
 #define FIREWALL_ENABLE_BYTE 0x73
 #define FIREWALL_APP_MARKER0 0x52
@@ -111,13 +121,17 @@
 // ─── Firewall Mode Runtime State ─────────────────────────────────────────────
 #ifndef FIREWALL_STATE_DEFINED
 #define FIREWALL_STATE_DEFINED
+struct FirewallBackboneSlot {
+    bool     enabled;
+    char     host[FIREWALL_BACKBONE_HOST_LEN];
+    uint16_t port;
+    bool     connected;
+};
+
 struct FirewallState {
     bool     enabled;
     bool     wifi_enabled;    // false = LoRa-only repeater (no WiFi)
-    uint8_t  tcp_mode;        // 0=disabled, 1=client
-    uint16_t tcp_port;        // Local port (client outbound)
-    char     backbone_host[64];
-    uint16_t backbone_port;   // Target port for client mode
+    FirewallBackboneSlot backbones[FIREWALL_BACKBONE_SLOTS];
 
     // AP TCP server settings
     bool     ap_tcp_enabled;  // Whether to run a WiFi AP with TCP server
@@ -154,7 +168,6 @@ struct FirewallState {
 
     // Runtime state
     bool     wifi_connected;
-    bool     tcp_connected;       // Backbone (WAN) connected
     bool     ap_tcp_connected;    // Local TCP server (LAN) has client
     bool     ap_active;
     uint32_t packets_bridged_lora_to_tcp;
@@ -165,6 +178,26 @@ struct FirewallState {
 
 // Global boundary state instance (defined in RNode_Firmware.ino)
 extern FirewallState firewall_state;
+
+inline size_t firewall_backbone_enabled_count() {
+    size_t count = 0;
+    for (size_t i = 0; i < FIREWALL_BACKBONE_SLOTS; i++) {
+        if (firewall_state.backbones[i].enabled) count++;
+    }
+    return count;
+}
+
+inline size_t firewall_backbone_connected_count() {
+    size_t count = 0;
+    for (size_t i = 0; i < FIREWALL_BACKBONE_SLOTS; i++) {
+        if (firewall_state.backbones[i].enabled && firewall_state.backbones[i].connected) count++;
+    }
+    return count;
+}
+
+inline bool firewall_any_backbone_enabled() {
+    return firewall_backbone_enabled_count() > 0;
+}
 
 // ─── Firewall Mode EEPROM Load/Save ─────────────────────────────────────────
 
@@ -220,12 +253,17 @@ inline void firewall_load_config() {
     if (!firewall_state.enabled) {
         // Use compile-time defaults
         firewall_state.wifi_enabled = true;
-        firewall_state.tcp_mode = FIREWALL_TCP_MODE;
-        firewall_state.tcp_port = FIREWALL_TCP_PORT;
-        strncpy(firewall_state.backbone_host, FIREWALL_BACKBONE_HOST,
-                sizeof(firewall_state.backbone_host) - 1);
-        firewall_state.backbone_host[sizeof(firewall_state.backbone_host) - 1] = '\0';
-        firewall_state.backbone_port = FIREWALL_BACKBONE_PORT;
+        for (size_t i = 0; i < FIREWALL_BACKBONE_SLOTS; i++) {
+            firewall_state.backbones[i].enabled = false;
+            firewall_state.backbones[i].host[0] = '\0';
+            firewall_state.backbones[i].port = FIREWALL_BACKBONE_PORT;
+            firewall_state.backbones[i].connected = false;
+        }
+        firewall_state.backbones[0].enabled = (FIREWALL_TCP_MODE == 1);
+        strncpy(firewall_state.backbones[0].host, FIREWALL_BACKBONE_HOST,
+            sizeof(firewall_state.backbones[0].host) - 1);
+        firewall_state.backbones[0].host[sizeof(firewall_state.backbones[0].host) - 1] = '\0';
+        firewall_state.backbones[0].port = FIREWALL_BACKBONE_PORT;
         firewall_state.ap_tcp_enabled = false;
         firewall_state.ap_tcp_port = 4242;
         firewall_state.ap_ssid[0] = '\0';
@@ -254,29 +292,42 @@ inline void firewall_load_config() {
     firewall_state.wifi_enabled = (wifi_en_byte == FIREWALL_ENABLE_BYTE || wifi_en_byte == 0xFF);
 
     // Load from EEPROM
-    firewall_state.tcp_mode = EEPROM.read(config_addr(ADDR_CONF_BTCP_MODE));
-    if (firewall_state.tcp_mode > 1) firewall_state.tcp_mode = 0; // 0=disabled, 1=client
-
-    firewall_state.tcp_port =
-        ((uint16_t)EEPROM.read(config_addr(ADDR_CONF_BTCP_PORT)) << 8) |
-        (uint16_t)EEPROM.read(config_addr(ADDR_CONF_BTCP_PORT + 1));
-    if (firewall_state.tcp_port == 0 || firewall_state.tcp_port == 0xFFFF) {
-        firewall_state.tcp_port = FIREWALL_TCP_PORT;
-    }
-
-    for (int i = 0; i < 63; i++) {
-        firewall_state.backbone_host[i] = EEPROM.read(config_addr(ADDR_CONF_BHOST + i));
-        if (firewall_state.backbone_host[i] == 0xFF) {
-            firewall_state.backbone_host[i] = '\0';
+    firewall_state.backbones[0].enabled =
+        (EEPROM.read(config_addr(ADDR_CONF_BTCP_MODE)) == 1);
+    for (int i = 0; i < (int)sizeof(firewall_state.backbones[0].host) - 1; i++) {
+        firewall_state.backbones[0].host[i] = EEPROM.read(config_addr(ADDR_CONF_BHOST + i));
+        if (firewall_state.backbones[0].host[i] == (char)0xFF) {
+            firewall_state.backbones[0].host[i] = '\0';
         }
     }
-    firewall_state.backbone_host[63] = '\0';
+    firewall_state.backbones[0].host[sizeof(firewall_state.backbones[0].host) - 1] = '\0';
 
-    firewall_state.backbone_port =
+    firewall_state.backbones[0].port =
         ((uint16_t)EEPROM.read(config_addr(ADDR_CONF_BHPORT)) << 8) |
         (uint16_t)EEPROM.read(config_addr(ADDR_CONF_BHPORT + 1));
-    if (firewall_state.backbone_port == 0 || firewall_state.backbone_port == 0xFFFF) {
-        firewall_state.backbone_port = FIREWALL_BACKBONE_PORT;
+    if (firewall_state.backbones[0].port == 0 || firewall_state.backbones[0].port == 0xFFFF) {
+        firewall_state.backbones[0].port = FIREWALL_BACKBONE_PORT;
+    }
+    firewall_state.backbones[0].connected = false;
+
+    for (size_t slot = 1; slot < FIREWALL_BACKBONE_SLOTS; slot++) {
+        firewall_state.backbones[slot].enabled =
+            (EEPROM.read(config_addr(ADDR_CONF_BSLOT_EN(slot))) == FIREWALL_ENABLE_BYTE);
+        for (int i = 0; i < (int)sizeof(firewall_state.backbones[slot].host) - 1; i++) {
+            firewall_state.backbones[slot].host[i] = EEPROM.read(config_addr(ADDR_CONF_BSLOT_HOST(slot) + i));
+            if (firewall_state.backbones[slot].host[i] == (char)0xFF) {
+                firewall_state.backbones[slot].host[i] = '\0';
+            }
+        }
+        firewall_state.backbones[slot].host[sizeof(firewall_state.backbones[slot].host) - 1] = '\0';
+
+        firewall_state.backbones[slot].port =
+            ((uint16_t)EEPROM.read(config_addr(ADDR_CONF_BSLOT_PORT(slot))) << 8) |
+            (uint16_t)EEPROM.read(config_addr(ADDR_CONF_BSLOT_PORT(slot) + 1));
+        if (firewall_state.backbones[slot].port == 0 || firewall_state.backbones[slot].port == 0xFFFF) {
+            firewall_state.backbones[slot].port = FIREWALL_BACKBONE_PORT;
+        }
+        firewall_state.backbones[slot].connected = false;
     }
 
     // Load AP TCP server settings
@@ -384,7 +435,9 @@ inline void firewall_load_config() {
     firewall_state.packets_bridged_tcp_to_lora = 0;
     firewall_state.last_bridge_activity = 0;
     firewall_state.wifi_connected = false;
-    firewall_state.tcp_connected = false;
+    for (size_t i = 0; i < FIREWALL_BACKBONE_SLOTS; i++) {
+        firewall_state.backbones[i].connected = false;
+    }
     firewall_state.ap_active = false;
 }
 
@@ -392,15 +445,28 @@ inline void firewall_save_config() {
     EEPROM.write(config_addr(ADDR_CONF_BMODE), FIREWALL_ENABLE_BYTE);
     EEPROM.write(config_addr(ADDR_CONF_WIFI_EN),
                  firewall_state.wifi_enabled ? FIREWALL_ENABLE_BYTE : 0x00);
-    EEPROM.write(config_addr(ADDR_CONF_BTCP_MODE), firewall_state.tcp_mode);
-    EEPROM.write(config_addr(ADDR_CONF_BTCP_PORT), (firewall_state.tcp_port >> 8) & 0xFF);
-    EEPROM.write(config_addr(ADDR_CONF_BTCP_PORT + 1), firewall_state.tcp_port & 0xFF);
-    for (int i = 0; i < 63; i++) {
-        EEPROM.write(config_addr(ADDR_CONF_BHOST + i), firewall_state.backbone_host[i]);
+    EEPROM.write(config_addr(ADDR_CONF_BTCP_MODE), firewall_state.backbones[0].enabled ? 1 : 0);
+    // Keep legacy BTCP_PORT in sync with backbone slot 1 for compatibility
+    // with older tooling that still inspects this field.
+    EEPROM.write(config_addr(ADDR_CONF_BTCP_PORT), (firewall_state.backbones[0].port >> 8) & 0xFF);
+    EEPROM.write(config_addr(ADDR_CONF_BTCP_PORT + 1), firewall_state.backbones[0].port & 0xFF);
+    for (int i = 0; i < (int)sizeof(firewall_state.backbones[0].host) - 1; i++) {
+        EEPROM.write(config_addr(ADDR_CONF_BHOST + i), firewall_state.backbones[0].host[i]);
     }
     EEPROM.write(config_addr(ADDR_CONF_BHOST + 63), 0x00);
-    EEPROM.write(config_addr(ADDR_CONF_BHPORT), (firewall_state.backbone_port >> 8) & 0xFF);
-    EEPROM.write(config_addr(ADDR_CONF_BHPORT + 1), firewall_state.backbone_port & 0xFF);
+    EEPROM.write(config_addr(ADDR_CONF_BHPORT), (firewall_state.backbones[0].port >> 8) & 0xFF);
+    EEPROM.write(config_addr(ADDR_CONF_BHPORT + 1), firewall_state.backbones[0].port & 0xFF);
+
+    for (size_t slot = 1; slot < FIREWALL_BACKBONE_SLOTS; slot++) {
+        EEPROM.write(config_addr(ADDR_CONF_BSLOT_EN(slot)),
+                     firewall_state.backbones[slot].enabled ? FIREWALL_ENABLE_BYTE : 0x00);
+        for (int i = 0; i < (int)sizeof(firewall_state.backbones[slot].host) - 1; i++) {
+            EEPROM.write(config_addr(ADDR_CONF_BSLOT_HOST(slot) + i), firewall_state.backbones[slot].host[i]);
+        }
+        EEPROM.write(config_addr(ADDR_CONF_BSLOT_HOST(slot) + sizeof(firewall_state.backbones[slot].host) - 1), 0x00);
+        EEPROM.write(config_addr(ADDR_CONF_BSLOT_PORT(slot)), (firewall_state.backbones[slot].port >> 8) & 0xFF);
+        EEPROM.write(config_addr(ADDR_CONF_BSLOT_PORT(slot) + 1), firewall_state.backbones[slot].port & 0xFF);
+    }
 
     // AP TCP server settings
     EEPROM.write(config_addr(ADDR_CONF_AP_TCP_EN),
