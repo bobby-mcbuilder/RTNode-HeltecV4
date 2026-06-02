@@ -913,7 +913,7 @@ void draw_disp_area() {
       disp_area.setTextColor(SSD1306_WHITE);
       disp_area.setTextSize(1);
       disp_area.setCursor(2, 8);
-      disp_area.printf("v%u.%u", (unsigned)MAJ_VERS, (unsigned)MIN_VERS);
+      disp_area.printf("v%s", FW_RELEASE_TAG);
     }
     if (firmware_update_mode) disp_area.drawBitmap(0, p_by, bm_fw_update, disp_area.width(), 27, SSD1306_WHITE, SSD1306_BLACK);
   } else {
