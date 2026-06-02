@@ -325,7 +325,7 @@
       <div class="version-row">
         <label for="version-select">Version</label>
         <select id="version-select">
-          <option value="latest">Latest Beta (bundled)</option>
+          <option value="" disabled selected>Loading mirrored releases...</option>
         </select>
       </div>
 
@@ -448,12 +448,10 @@
   function getBinUrl(fw, isUpdate) {
     const name = isUpdate ? fw.updateName : fw.fullName;
     const ver  = versionSelect.value;
-    if (ver === 'latest') return `firmware/${name}`;
     return `firmware/${ver}/${name}`;
   }
 
   function assetAvailable(ver, name) {
-    if (ver === 'latest') return true;
     const set = versionAssets.get(ver);
     return !!(set && set.has(name));
   }
@@ -462,16 +460,34 @@
   (async () => {
     try {
       const res = await fetch('firmware/versions.json', { cache: 'no-cache' });
-      if (!res.ok) return;
+      if (!res.ok) {
+        versionSelect.innerHTML = '<option value="" disabled selected>No mirrored releases found</option>';
+        versionSelect.disabled = true;
+        return;
+      }
       const versions = await res.json();
+      versionSelect.innerHTML = '';
+      let count = 0;
       for (const v of versions) {
         versionAssets.set(v.tag, new Set(v.assets || []));
         const opt = document.createElement('option');
         opt.value       = v.tag;
         opt.textContent = formatReleaseLabel(v.tag, v.name, v.stability);
         versionSelect.appendChild(opt);
+        count++;
       }
-    } catch (_) { /* manifest missing — latest (bundled) remains the only option */ }
+
+      if (count === 0) {
+        versionSelect.innerHTML = '<option value="" disabled selected>No mirrored releases found</option>';
+        versionSelect.disabled = true;
+      } else {
+        versionSelect.selectedIndex = 0;
+        versionSelect.disabled = false;
+      }
+    } catch (_) {
+      versionSelect.innerHTML = '<option value="" disabled selected>No mirrored releases found</option>';
+      versionSelect.disabled = true;
+    }
   })();
 
   // ── Detection — mirrors detect_board() in flash.py ─────────────────────────
@@ -636,7 +652,7 @@
       const binUrl = getBinUrl(fw, currentIsUpdate);
       const addr   = currentIsUpdate ? fw.updateAddr : fw.fullAddr;
 
-      log(`Version:  ${ver === 'latest' ? `Latest bundled ${RELEASE_CHANNEL}` : `${ver} (${RELEASE_CHANNEL})`}`);
+      log(`Version:  ${ver} (${RELEASE_CHANNEL})`);
       log(`Mode:     ${currentIsUpdate ? 'Update (app only, settings preserved)' : 'Full install (erase all)'}`);
       log(`Firmware: ${binUrl}`);
       const resp = await fetch(binUrl);
