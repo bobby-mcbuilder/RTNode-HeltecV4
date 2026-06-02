@@ -287,7 +287,7 @@ release-all: console-site spiffs-image release-tbeam release-tbeam_sx1262 releas
 # by flash.py.  Individual binaries are stored flat inside the zip.
 check-release-version:
 	@if [ -z "$(RELEASE_TAG)" ]; then \
-		echo "ERROR: RELEASE_TAG is required (example: make release-pio-tagged RELEASE_TAG=v1.0.36)"; \
+			echo "ERROR: RELEASE_TAG is required (example: make release-pio-tagged RELEASE_TAG=v1.0.37)"; \
 		exit 2; \
 	fi
 	@fw_tag=$$(grep -E '^[[:space:]]*#define[[:space:]]+FW_RELEASE_TAG' Config.h | sed -E 's/.*\"([^\"]+)\".*/\1/'); \

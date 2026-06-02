@@ -785,22 +785,22 @@ void draw_stat_area() {
     stat_area.setTextSize(1);
 
     // Row 1 — LORA
-    stat_area.fillCircle(4, 3, 3, radio_online ? SSD1306_WHITE : SSD1306_BLACK);
-    stat_area.drawCircle(4, 3, 3, SSD1306_WHITE);
+    stat_area.fillCircle(4, 4, 3, radio_online ? SSD1306_WHITE : SSD1306_BLACK);
+    stat_area.drawCircle(4, 4, 3, SSD1306_WHITE);
     stat_area.setCursor(10, 6);
     stat_area.print(radio_online ? "LORA" : "lora");
 
     // Row 2 — WIFI
     if (!firewall_state.wifi_enabled) {
-      stat_area.drawCircle(4, 13, 3, SSD1306_WHITE);
+      stat_area.drawCircle(4, 14, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 16);
       stat_area.print("wifi");
     } else if (wifi_is_connected()) {
-      stat_area.fillCircle(4, 13, 3, SSD1306_WHITE);
+      stat_area.fillCircle(4, 14, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 16);
       stat_area.print("WIFI");
     } else {
-      stat_area.drawCircle(4, 13, 3, SSD1306_WHITE);
+      stat_area.drawCircle(4, 14, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 16);
       stat_area.print("wifi");
     }
@@ -809,25 +809,25 @@ void draw_stat_area() {
     size_t wan_enabled = firewall_backbone_enabled_count();
     size_t wan_connected = firewall_backbone_connected_count();
     if (wan_enabled == 0) {
-      stat_area.drawCircle(4, 23, 3, SSD1306_WHITE);
+      stat_area.drawCircle(4, 24, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 26);
-      stat_area.printf("WAN:0/4");
+      stat_area.printf("WAN:0/%u", (unsigned)wan_enabled);
     } else if (wan_connected > 0) {
-      stat_area.fillCircle(4, 23, 3, SSD1306_WHITE);
+      stat_area.fillCircle(4, 24, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 26);
-      stat_area.printf("WAN:%u/4", (unsigned)wan_connected);
+      stat_area.printf("WAN:%u/%u", (unsigned)wan_connected, (unsigned)wan_enabled);
     } else {
-      stat_area.drawCircle(4, 23, 3, SSD1306_WHITE);
+      stat_area.drawCircle(4, 24, 3, SSD1306_WHITE);
       stat_area.setCursor(10, 26);
-      stat_area.printf("WAN:%u/4", (unsigned)wan_connected);
+      stat_area.printf("WAN:%u/%u", (unsigned)wan_connected, (unsigned)wan_enabled);
     }
 
     // Row 4 — LAN / local TCP server (hidden when disabled)
     if (firewall_state.ap_tcp_enabled) {
       if (firewall_state.ap_tcp_connected) {
-        stat_area.fillCircle(4, 33, 3, SSD1306_WHITE);
+        stat_area.fillCircle(4, 34, 3, SSD1306_WHITE);
       } else {
-        stat_area.drawCircle(4, 33, 3, SSD1306_WHITE);
+        stat_area.drawCircle(4, 34, 3, SSD1306_WHITE);
       }
       stat_area.setCursor(10, 36);
       stat_area.print("LAN");
@@ -967,7 +967,7 @@ void draw_disp_area() {
       }
 
       // Local TCP server port (shown only when enabled)
-      disp_area.setCursor(2, 55);
+      disp_area.setCursor(3, 58);
       if (firewall_state.ap_tcp_enabled) {
         disp_area.printf("Port:%u", firewall_state.ap_tcp_port);
       }
