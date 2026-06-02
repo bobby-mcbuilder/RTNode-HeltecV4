@@ -285,6 +285,19 @@ release-all: console-site spiffs-image release-tbeam release-tbeam_sx1262 releas
 # Build all PlatformIO environments and package them into a single release archive.
 # The archive (rtnode_firmware.zip) is the primary distribution artefact consumed
 # by flash.py.  Individual binaries are stored flat inside the zip.
+check-release-version:
+	@if [ -z "$(RELEASE_TAG)" ]; then \
+		echo "ERROR: RELEASE_TAG is required (example: make release-pio-tagged RELEASE_TAG=v1.0.36)"; \
+		exit 2; \
+	fi
+	@fw_tag=$$(grep -E '^[[:space:]]*#define[[:space:]]+FW_RELEASE_TAG' Config.h | sed -E 's/.*\"([^\"]+)\".*/\1/'); \
+		release_no_v=$${RELEASE_TAG#v}; \
+		if [ "$$fw_tag" != "$$release_no_v" ]; then \
+			echo "ERROR: FW_RELEASE_TAG ($$fw_tag) does not match RELEASE_TAG ($(RELEASE_TAG))"; \
+			exit 1; \
+		fi; \
+		echo "Version check passed: FW_RELEASE_TAG=$$fw_tag RELEASE_TAG=$(RELEASE_TAG)"
+
 release-pio:
 	pio run -e rtnode_heltec_v4 -e rtnode_heltec_v3
 	python3 flash.py --board v4 --merge-only --offline
@@ -304,6 +317,8 @@ zf = zipfile.ZipFile('rtnode_firmware.zip','w',zipfile.ZIP_DEFLATED); \
 zf.close(); \
 print('Created rtnode_firmware.zip with', len(variants), 'variants'); \
 "
+
+release-pio-tagged: check-release-version release-pio
 
 release-hashes:
 	python ./release_hashes.py > ./Release/release.json
