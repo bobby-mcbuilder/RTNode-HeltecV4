@@ -1,10 +1,10 @@
 [
   {
-    "tag": "v1.0.38",
-    "name": "v1.0.38",
+    "tag": "v1.0.39",
+    "name": "v1.0.39",
     "stability": "beta",
     "prerelease": true,
-    "published_at": "2026-06-02T22:40:08Z",
+    "published_at": "2026-06-03T02:40:43Z",
     "assets": [
       "rtnode_heltec_v3.bin",
       "rtnode_heltec_v3_merged.bin",
