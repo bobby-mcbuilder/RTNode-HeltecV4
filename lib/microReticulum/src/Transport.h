@@ -371,6 +371,9 @@ namespace RNS {
 		static uint16_t remove_tunnels(const std::vector<Bytes>& hashes);
 
 		static Destination find_destination_from_hash(const Bytes& destination_hash);
+		static bool is_whitelisted_packet_address(const Bytes& destination_hash);
+		static bool packet_contains_whitelisted_address(const Packet& packet);
+		static const char* packet_whitelist_annotation(const Packet& packet);
 
 		// CBA
 		static void cull_path_table();
