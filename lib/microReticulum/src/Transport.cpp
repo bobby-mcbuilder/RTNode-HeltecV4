@@ -160,7 +160,7 @@ static void flatset_insert(std::vector<Bytes>& vec, const Bytes& key) {
 static std::vector<Bytes> _boundary_local_addresses;
 // BOUNDARY MODE Whitelist 2: addresses mentioned in packets from local devices
 static std::vector<Bytes> _boundary_mentioned_addresses;
-static const uint16_t _boundary_maxsize = 128;
+static const uint16_t _boundary_maxsize = 200;
 
 // BOUNDARY MODE: Check if an interface is the backbone
 static bool is_backbone_interface(const Interface& iface) {

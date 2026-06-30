@@ -149,10 +149,10 @@ namespace RNS {
 #endif
 		};
 
-		/// Max alternative paths stored per destination (N=2 — reduced for ESP32 heap).
-		static const size_t MAX_PATHS_PER_DEST = 2;
-		/// Max entries in the global anti-replay blob set (8 — reduced for ESP32).
-		static const size_t MAX_GLOBAL_BLOBS = 8;
+		/// Max alternative paths stored per destination (N=3).
+		static const size_t MAX_PATHS_PER_DEST = 3;
+		/// Max entries in the global anti-replay blob set.
+		static const size_t MAX_GLOBAL_BLOBS = 16;
 
 		// ── Legacy DestinationEntry (kept for tunnel path serialization) ──
 		// CBA TODO Analyze safety of using Interface references here

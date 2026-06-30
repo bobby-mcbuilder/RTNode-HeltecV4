@@ -985,10 +985,9 @@ void setup() {
       // ── Firewall Mode: Load config and optionally set up WiFi + TCP ──
       HEAD("Firewall Mode: Initializing...", RNS::LOG_TRACE);
 
-      // ESP32 has only ~324KB heap. Keep tables small to avoid heap exhaustion.
-      // With multi-path (N=2), each dest holds up to 2 PathEntry objects (~80 bytes each).
-      RNS::Transport::path_table_maxsize(16);
-      RNS::Transport::path_table_maxpersist(8);
+      // ESP32 has only ~324KB heap. Each path entry costs ~80 bytes.
+      RNS::Transport::path_table_maxsize(24);
+      RNS::Transport::path_table_maxpersist(12);
       boundary_nominal_path_table_maxsize = RNS::Transport::path_table_maxsize();
       boundary_nominal_path_table_maxpersist = RNS::Transport::probe_destination_enabled();
       firewall_load_config();
