@@ -6,7 +6,10 @@
     "prerelease": false,
     "published_at": "2026-06-30T18:46:41Z",
     "assets": [
-      "rtnode_heltec_v4.bin"
+      "rtnode_heltec_v3.bin",
+      "rtnode_heltec_v3_merged.bin",
+      "rtnode_heltec_v4.bin",
+      "rtnode_heltec_v4_merged.bin"
     ]
   },
   {
