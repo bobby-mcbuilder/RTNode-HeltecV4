@@ -21,7 +21,7 @@
 
 	#define MAJ_VERS  0x01
 	#define MIN_VERS  0x28
-	#define FW_RELEASE_TAG "1.0.39"
+	#define FW_RELEASE_TAG "1.0.40"
 
 	#define MODE_HOST 0x11
 	#define MODE_TNC  0x12
