@@ -1,5 +1,15 @@
 [
   {
+    "tag": "v1.0.40",
+    "name": "v1.0.40 \u2014 Multi-Path Path Table, MODE_FULL, Heap Fixes",
+    "stability": "beta",
+    "prerelease": false,
+    "published_at": "2026-06-30T18:46:41Z",
+    "assets": [
+      "rtnode_heltec_v4.bin"
+    ]
+  },
+  {
     "tag": "v1.0.39",
     "name": "v1.0.39",
     "stability": "beta",
