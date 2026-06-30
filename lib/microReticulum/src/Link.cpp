@@ -1544,6 +1544,11 @@ void Link::attached_interface(const Interface& interface) {
 	_object->_attached_interface = interface;
 }
 
+const Interface& Link::attached_interface() const {
+	assert(_object);
+	return _object->_attached_interface;
+}
+
 void Link::establishment_timeout(double timeout) {
 	assert(_object);
 	_object->_establishment_timeout = timeout;

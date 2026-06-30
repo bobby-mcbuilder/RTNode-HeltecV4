@@ -6,6 +6,7 @@
 
 #include <map>
 #include <vector>
+#include <deque>
 #include <list>
 #include <set>
 #include <array>
@@ -102,7 +103,59 @@ namespace RNS {
 #endif
 		};
 
-		// CBA TODO Analyze safety of using Inrerface references here
+		// ── Multi-Path Path Table ───────────────────────────────────────
+		// Each announce inserts a PathEntry (no quality gate — all valid
+		// announces coexist).  At forwarding time, select_path() picks the
+		// best entry by score = bitrate / (hops+1).
+		// Replaces the old single-entry DestinationEntry path table.
+		class PathEntry {
+		public:
+			PathEntry() {}
+			PathEntry(double timestamp, const Bytes& next_hop, uint8_t hops, double expires, const Bytes& receiving_interface, const Bytes& packet_hash) :
+				timestamp(timestamp),
+				next_hop(next_hop),
+				hops(hops),
+				expires(expires),
+				receiving_interface(receiving_interface),
+				packet_hash(packet_hash)
+			{
+			}
+			/// Score = bitrate / (hops+1).  Higher is better.
+			/// Falls back to 1000 bps when interface bitrate is unknown.
+			double score(uint32_t iface_bitrate) const {
+				if (iface_bitrate == 0) iface_bitrate = 1000;
+				return (double)iface_bitrate / (double)(hops + 1);
+			}
+			inline bool is_expired(double now) const { return now >= expires; }
+
+		public:
+			double timestamp = 0;
+			Bytes next_hop;
+			uint8_t hops = 0;
+			double expires = 0;
+			Bytes receiving_interface;   // interface hash
+			Bytes packet_hash;           // for per-dest dedup
+#ifndef NDEBUG
+			inline std::string debugString() const {
+				std::string dump;
+				dump = "PathEntry: ts=" + std::to_string(timestamp) +
+					" nh=" + next_hop.toHex().substr(0,8) +
+					" hops=" + std::to_string(hops) +
+					" exp=" + std::to_string(expires) +
+					" iface=" + receiving_interface.toHex().substr(0,8) +
+					" pkt=" + packet_hash.toHex().substr(0,8);
+				return dump;
+			}
+#endif
+		};
+
+		/// Max alternative paths stored per destination (N=2 — reduced for ESP32 heap).
+		static const size_t MAX_PATHS_PER_DEST = 2;
+		/// Max entries in the global anti-replay blob set (8 — reduced for ESP32).
+		static const size_t MAX_GLOBAL_BLOBS = 8;
+
+		// ── Legacy DestinationEntry (kept for tunnel path serialization) ──
+		// CBA TODO Analyze safety of using Interface references here
 		// CBA TODO Analyze safety of using Packet references here
 		class DestinationEntry {
 		public:
@@ -224,7 +277,7 @@ namespace RNS {
 			}
 		public:
 			Interface _receiving_interface = {Type::NONE};
-			const Interface _outbound_interface = {Type::NONE};
+			Interface _outbound_interface = {Type::NONE};
 			double _timestamp = 0;
 		};
 
@@ -238,9 +291,9 @@ namespace RNS {
 			{
 			}
 		public:
-			const Bytes _destination_hash;
+			Bytes _destination_hash;
 			double _timeout = 0;
-			const Interface _requesting_interface = {Type::NONE};
+			Interface _requesting_interface = {Type::NONE};
 		};
 
 /*
@@ -341,6 +394,7 @@ namespace RNS {
 		static double first_hop_timeout(const Bytes& destination_hash);
 		static double extra_link_proof_timeout(const Interface& interface);
 		static bool expire_path(const Bytes& destination_hash);
+		static bool mark_path_unresponsive(const Bytes& destination_hash, const Bytes& blocked_interface = {});
 		//static void request_path(const Bytes& destination_hash, const Interface& on_interface = {Type::NONE}, const Bytes& tag = {}, bool recursive = false);
 		static void request_path(const Bytes& destination_hash, const Interface& on_interface, const Bytes& tag = {}, bool recursive = false);
 		static void request_path(const Bytes& destination_hash);
@@ -361,6 +415,7 @@ namespace RNS {
 		static void write_tunnel_table();
 		static void persist_data();
 		static void clean_caches();
+		static void clear_caches_in_memory();   // aggressive in-memory cache clearing for heap pressure
 		static void dump_stats();
 		static void exit_handler();
 
@@ -378,6 +433,10 @@ namespace RNS {
 		// CBA
 		static void cull_path_table();
 
+		/// Select the best non-expired path for a destination by score = bitrate/(hops+1).
+		/// Returns nullptr if no valid path exists.
+		static const PathEntry* select_path(const Bytes& destination_hash);
+
 		// getters/setters
 		static inline void set_receive_packet_callback(Callbacks::receive_packet callback) { _callbacks._receive_packet = callback; }
 		static inline void set_transmit_packet_callback(Callbacks::transmit_packet callback) { _callbacks._transmit_packet = callback; }
@@ -391,8 +450,8 @@ namespace RNS {
 		// CBA TEST
 		static inline void identity(Identity& identity) { _identity = identity; }
 
-		inline static const std::map<Bytes, DestinationEntry>& get_destination_table() { return _destination_table; }
-		inline static const std::map<Bytes, RateEntry>& get_announce_rate_table() { return _announce_rate_table; }
+		inline static const std::map<Bytes, std::deque<PathEntry>>& get_destination_table() { return _destination_table; }
+		inline static const std::vector<std::pair<Bytes, RateEntry>>& get_announce_rate_table() { return _announce_rate_table; }
 		inline static const std::map<Bytes, LinkEntry>& get_link_table() { return _link_table; }
 
 	private:
@@ -416,7 +475,7 @@ namespace RNS {
 		// CBA TODO: Reconsider using std::set for enforcing uniqueness. Maybe consider std::map keyed on hash instead
 		static std::set<Link> _pending_links;           // Links that are being established
 		static std::set<Link> _active_links;           // Links that are active
-		static std::set<Bytes> _packet_hashlist;           // A list of packet hashes for duplicate detection
+		static std::vector<Bytes> _packet_hashlist;           // Flat vector for duplicate detection (linear search, no fragmentation)
 		static std::list<PacketReceipt> _receipts;           // Receipts of all outgoing packets for proof processing
 
 		// TODO: "destination_table" should really be renamed to "path_table"
@@ -424,16 +483,19 @@ namespace RNS {
 		// 55.100 path table entries or approximately 22.300 link table entries.
 
 		static std::map<Bytes, AnnounceEntry> _announce_table;           // A table for storing announces currently waiting to be retransmitted
-		static std::map<Bytes, DestinationEntry> _destination_table;           // A lookup table containing the next hop to a given destination
-		static std::map<Bytes, ReverseEntry> _reverse_table;           // A lookup table for storing packet hashes used to return proofs and replies
+		// Multi-path path table: dest_hash → deque of PathEntry (newest-first, max N=3)
+		static std::map<Bytes, std::deque<PathEntry>> _destination_table;
+		// Global anti-replay blob vector (capped at MAX_GLOBAL_BLOBS, linear search OK at N=8)
+		static std::vector<Bytes> _global_blobs;
+		static std::vector<std::pair<Bytes, ReverseEntry>> _reverse_table;           // Flat vector for proof/reply routing (no tree nodes)
 		static std::map<Bytes, LinkEntry> _link_table;           // A lookup table containing hops for links
 		static std::map<Bytes, AnnounceEntry> _held_announces;           // A table containing temporarily held announce-table entries
 		static std::set<HAnnounceHandler> _announce_handlers;           // A table storing externally registered announce handlers
 		static std::map<Bytes, TunnelEntry> _tunnels;           // A table storing tunnels to other transport instances
-		static std::map<Bytes, RateEntry> _announce_rate_table;           // A table for keeping track of announce rates
-		static std::map<Bytes, double> _path_requests;           // A table for storing path request timestamps
+		static std::vector<std::pair<Bytes, RateEntry>> _announce_rate_table;           // Flat vector for announce rate tracking (no tree nodes)
+		static std::vector<std::pair<Bytes, double>> _path_requests;           // Flat vector for path request timestamps (no tree nodes)
 
-		static std::map<Bytes, PathRequestEntry> _discovery_path_requests;       // A table for keeping track of path requests on behalf of other nodes
+		static std::vector<std::pair<Bytes, PathRequestEntry>> _discovery_path_requests;       // Flat vector for waiting path requests (no tree nodes)
 		static std::set<Bytes> _discovery_pr_tags;       // A table for keeping track of tagged path requests
 
 		// Transport control destinations are used

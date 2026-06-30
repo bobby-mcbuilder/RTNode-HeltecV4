@@ -7,8 +7,9 @@
 #include "Packet.h"
 #include "Interface.h"
 #include "Log.h"
-#include "Cryptography/HKDF.h"
 #include "Cryptography/Random.h"
+#include "Cryptography/HKDF.h"
+#include "Utilities/OS.h"
 #include "Utilities/Persistence.h"
 
 #include <algorithm>
@@ -18,6 +19,60 @@
 using namespace RNS;
 using namespace RNS::Type::Transport;
 using namespace RNS::Utilities;
+
+// ── Flat-map helpers (vector<pair<Bytes,T>> replaces std::map<Bytes,T>) ────
+// Eliminates per-element tree-node allocation. Linear search is fine
+// for N ≤ ~1000 on ESP32.
+
+template <typename T>
+static typename std::vector<std::pair<Bytes, T>>::iterator
+flatmap_find(std::vector<std::pair<Bytes, T>>& vec, const Bytes& key) {
+	for (auto it = vec.begin(); it != vec.end(); ++it) {
+		if (it->first == key) return it;
+	}
+	return vec.end();
+}
+
+template <typename T>
+static typename std::vector<std::pair<Bytes, T>>::const_iterator
+flatmap_find(const std::vector<std::pair<Bytes, T>>& vec, const Bytes& key) {
+	for (auto it = vec.begin(); it != vec.end(); ++it) {
+		if (it->first == key) return it;
+	}
+	return vec.end();
+}
+
+template <typename T>
+static void flatmap_upsert(std::vector<std::pair<Bytes, T>>& vec, const Bytes& key, const T& value) {
+	auto it = flatmap_find(vec, key);
+	if (it != vec.end()) {
+		it->second = value;
+	} else {
+		vec.push_back({key, value});
+	}
+}
+
+template <typename T>
+static bool flatmap_erase(std::vector<std::pair<Bytes, T>>& vec, const Bytes& key) {
+	auto it = flatmap_find(vec, key);
+	if (it != vec.end()) {
+		vec.erase(it);
+		return true;
+	}
+	return false;
+}
+
+// ── Flat-set helpers (vector<Bytes> replaces std::set<Bytes>) ──────────────
+
+static bool flatset_contains(const std::vector<Bytes>& vec, const Bytes& key) {
+	return std::find(vec.begin(), vec.end(), key) != vec.end();
+}
+
+static void flatset_insert(std::vector<Bytes>& vec, const Bytes& key) {
+	if (!flatset_contains(vec, key)) {
+		vec.push_back(key);
+	}
+}
 
 #if defined(INTERFACES_SET)
 ///*static*/ std::set<std::reference_wrapper<const Interface>, std::less<const Interface>> Transport::_interfaces;
@@ -34,20 +89,21 @@ using namespace RNS::Utilities;
 #endif
 /*static*/ std::set<Link> Transport::_pending_links;
 /*static*/ std::set<Link> Transport::_active_links;
-/*static*/ std::set<Bytes> Transport::_packet_hashlist;
+/*static*/ std::vector<Bytes> Transport::_packet_hashlist;
+/*static*/ std::vector<Bytes> Transport::_global_blobs;
 /*static*/ std::list<PacketReceipt> Transport::_receipts;
 
 /*static*/ std::map<Bytes, Transport::AnnounceEntry> Transport::_announce_table;
-/*static*/ std::map<Bytes, Transport::DestinationEntry> Transport::_destination_table;
-/*static*/ std::map<Bytes, Transport::ReverseEntry> Transport::_reverse_table;
+/*static*/ std::map<Bytes, std::deque<Transport::PathEntry>> Transport::_destination_table;
+/*static*/ std::vector<std::pair<Bytes, Transport::ReverseEntry>> Transport::_reverse_table;
 /*static*/ std::map<Bytes, Transport::LinkEntry> Transport::_link_table;
 /*static*/ std::map<Bytes, Transport::AnnounceEntry> Transport::_held_announces;
 /*static*/ std::set<HAnnounceHandler> Transport::_announce_handlers;
 /*static*/ std::map<Bytes, Transport::TunnelEntry> Transport::_tunnels;
-/*static*/ std::map<Bytes, Transport::RateEntry> Transport::_announce_rate_table;
-/*static*/ std::map<Bytes, double> Transport::_path_requests;
+/*static*/ std::vector<std::pair<Bytes, Transport::RateEntry>> Transport::_announce_rate_table;
+/*static*/ std::vector<std::pair<Bytes, double>> Transport::_path_requests;
 
-/*static*/ std::map<Bytes, Transport::PathRequestEntry> Transport::_discovery_path_requests;
+/*static*/ std::vector<std::pair<Bytes, Transport::PathRequestEntry>> Transport::_discovery_path_requests;
 /*static*/ std::set<Bytes> Transport::_discovery_pr_tags;
 
 /*static*/ std::set<Destination> Transport::_control_destinations;
@@ -60,7 +116,6 @@ using namespace RNS::Utilities;
 
 // CBA
 /*static*/ std::map<Bytes, Transport::PacketEntry> Transport::_packet_table;
-/*static*/ std::set<Bytes> Transport::_known_cached_packet_hashes;
 
 /*static*/ uint16_t Transport::_LOCAL_CLIENT_CACHE_MAXSIZE = 512;
 
@@ -101,158 +156,15 @@ using namespace RNS::Utilities;
 
 /*static*/ Reticulum Transport::_owner({Type::NONE});
 
-// FIREWALL MODE Whitelist 1: addresses of trusted local devices.
-static std::set<Bytes> _boundary_local_addresses;
-// FIREWALL MODE Whitelist 2: destinations explicitly mentioned by trusted
-// LAN-side traffic. Path requests contribute the requested destination from
-// the payload, not the path.request control hash.
-static std::set<Bytes> _boundary_mentioned_addresses;
-static const uint16_t _boundary_maxsize = 200;
-static Bytes _path_request_control_hash;
+// BOUNDARY MODE Whitelist 1: addresses of local devices (from LoRa and LocalTCP interfaces)
+static std::vector<Bytes> _boundary_local_addresses;
+// BOUNDARY MODE Whitelist 2: addresses mentioned in packets from local devices
+static std::vector<Bytes> _boundary_mentioned_addresses;
+static const uint16_t _boundary_maxsize = 128;
 
-// FIREWALL MODE: Check if an interface is the backbone
+// BOUNDARY MODE: Check if an interface is the backbone
 static bool is_backbone_interface(const Interface& iface) {
 	return iface.is_backbone();
-}
-
-#ifdef FIREWALL_MODE
-static bool boundary_hash_in_local_whitelist(const Bytes& destination_hash) {
-	return destination_hash && _boundary_local_addresses.find(destination_hash) != _boundary_local_addresses.end();
-}
-
-static bool boundary_hash_in_mentioned_whitelist(const Bytes& destination_hash) {
-	return destination_hash && _boundary_mentioned_addresses.find(destination_hash) != _boundary_mentioned_addresses.end();
-}
-
-static bool is_boundary_trusted_interface(const Interface& iface) {
-	// In boundary mode, backbone interfaces are WAN/untrusted ingress.
-	// All non-backbone ingress (LoRa, on-device/local interfaces) is local/trusted.
-	if (is_backbone_interface(iface)) {
-		return false;
-	}
-	return true;
-}
-
-static bool is_boundary_untrusted_interface(const Interface& iface) {
-	return !is_boundary_trusted_interface(iface);
-}
-
-static bool boundary_hash_is_whitelisted(const Bytes& destination_hash) {
-	if (!destination_hash) {
-		return false;
-	}
-
-	return boundary_hash_in_local_whitelist(destination_hash)
-		|| boundary_hash_in_mentioned_whitelist(destination_hash);
-}
-
-static bool is_path_request_control_packet(const Packet& packet) {
-	return _path_request_control_hash && packet.destination_hash() == _path_request_control_hash;
-}
-
-static Bytes boundary_referenced_destination(const Packet& packet) {
-	if (is_path_request_control_packet(packet)) {
-		const Bytes& data = packet.data();
-		if (data.size() >= Type::Identity::TRUNCATED_HASHLENGTH/8) {
-			return data.left(Type::Identity::TRUNCATED_HASHLENGTH/8);
-		}
-		return Bytes();
-	}
-
-	return packet.destination_hash();
-}
-#endif
-
-static std::string boundary_hash_label(const Bytes& destination_hash) {
-	if (!destination_hash) {
-		return "--------";
-	}
-
-	return destination_hash.toHex().substr(0,8);
-}
-
-static Bytes boundary_log_destination(const Packet& packet) {
-#ifdef FIREWALL_MODE
-	return boundary_referenced_destination(packet);
-#else
-	return packet.destination_hash();
-#endif
-}
-
-static const char* boundary_whitelist_annotation(const Bytes& destination_hash) {
-#ifdef FIREWALL_MODE
-	return boundary_hash_is_whitelisted(destination_hash) ? " (WHITELISTED)" : " (BLACKLISTED)";
-#else
-	(void)destination_hash;
-	return "";
-#endif
-}
-
-/*static*/ bool Transport::is_whitelisted_packet_address(const Bytes& destination_hash) {
-#ifdef FIREWALL_MODE
-	if (!destination_hash) {
-		return false;
-	}
-
-	if (boundary_hash_is_whitelisted(destination_hash)) {
-		return true;
-	}
-
-	if (_identity.hash() && destination_hash == _identity.hash()) {
-		return true;
-	}
-
-	if (_control_hashes.find(destination_hash) != _control_hashes.end()) {
-		return true;
-	}
-
-#if defined(DESTINATIONS_SET)
-	for (const auto& destination : _destinations) {
-		if (destination.hash() == destination_hash) {
-			return true;
-		}
-	}
-#elif defined(DESTINATIONS_MAP)
-	if (_destinations.find(destination_hash) != _destinations.end()) {
-		return true;
-	}
-#endif
-#else
-	(void)destination_hash;
-#endif
-
-	return false;
-}
-
-/*static*/ bool Transport::packet_contains_whitelisted_address(const Packet& packet) {
-#ifdef FIREWALL_MODE
-	if (is_whitelisted_packet_address(packet.destination_hash())) {
-		return true;
-	}
-
-	Bytes referenced_destination = boundary_log_destination(packet);
-	if (referenced_destination && referenced_destination != packet.destination_hash()
-	    && is_whitelisted_packet_address(referenced_destination)) {
-		return true;
-	}
-
-	if (is_whitelisted_packet_address(packet.transport_id())) {
-		return true;
-	}
-#else
-	(void)packet;
-#endif
-
-	return false;
-}
-
-/*static*/ const char* Transport::packet_whitelist_annotation(const Packet& packet) {
-#ifdef FIREWALL_MODE
-	return packet_contains_whitelisted_address(packet) ? " (WHITELISTED)" : " (BLACKLISTED)";
-#else
-	(void)packet;
-	return "";
-#endif
 }
 /*static*/ Identity Transport::_identity({Type::NONE});
 
@@ -328,12 +240,11 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 	// Create transport-specific destination for path request
 	Destination path_request_destination({Type::NONE}, Type::Destination::IN, Type::Destination::PLAIN, APP_NAME, "path.request");
 	path_request_destination.set_packet_callback(path_request_handler);
-	_path_request_control_hash = path_request_destination.hash();
 	// CBA ACCUMULATES
 	_control_destinations.insert(path_request_destination);
 	// CBA ACCUMULATES
-	_control_hashes.insert(_path_request_control_hash);
-	DEBUG("Created transport-specific path request destination " + _path_request_control_hash.toHex());
+	_control_hashes.insert(path_request_destination.hash());
+	DEBUG("Created transport-specific path request destination " + path_request_destination.hash().toHex());
 
 	// Create transport-specific destination for tunnel synthesize
 	Destination tunnel_synthesize_destination({Type::NONE}, Type::Destination::IN, Type::Destination::PLAIN, APP_NAME, "tunnel.synthesize");
@@ -419,17 +330,25 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 				for (auto& link : pending_links) {
 					if (link.status() == Type::Link::CLOSED) {
 						// If we are not a Transport Instance, finding a pending link
-						// that was never activated will trigger an expiry of the path
-						// to the destination, and an attempt to rediscover the path.
+						// that was never activated will trigger removal of the path
+						// via the link's interface, leaving backup paths intact.
 						if (!Reticulum::transport_enabled()) {
-							expire_path(link.destination().hash());
+							// Remove only the path on the failed link's interface,
+							// so other paths (e.g. LoRa) survive the failure.
+							Interface failed_iface = link.attached_interface();
+							if (failed_iface) {
+								DEBUG("Removing path to " + link.destination().hash().toHex() + " via " + failed_iface.toString() + " (link closed, backup paths survive)");
+								mark_path_unresponsive(link.destination().hash(), failed_iface.get_hash());
+							} else {
+								expire_path(link.destination().hash());
+							}
 
 							// If we are connected to a shared instance, it will take
 							// care of sending out a new path request. If not, we will
 							// send one directly.
 							if (!_owner.is_connected_to_shared_instance()) {
 								double last_path_request = 0;
-								auto iter = _path_requests.find(link.destination().hash());
+								auto iter = flatmap_find(_path_requests, link.destination().hash());
 								if (iter != _path_requests.end()) {
 									last_path_request = (*iter).second;
 								}
@@ -488,12 +407,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 			// Process announces needing retransmission
 			if (OS::time() > (_announces_last_checked + _announces_check_interval)) {
 				DEBUG("DIAG: ANNOUNCE-TBL size=" + std::to_string(_announce_table.size()));
-#ifdef FIREWALL_MODE
-				while (_announce_table.size() > 8) {
-					DEBUG("BOUNDARY: Culling queued announce to protect heap (annc=" + std::to_string(_announce_table.size()) + ")");
-					_announce_table.erase(_announce_table.begin());
-				}
-#endif
 				//p for destination_hash in Transport.announce_table:
 				for (auto& [destination_hash, announce_entry] : _announce_table) {
 				//for (auto& pair : _announce_table) {
@@ -615,23 +528,22 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 			}
 
 			// Cull the packet hashlist if it has reached its max size
-			while (_packet_hashlist.size() > _hashlist_maxsize) {
-				_packet_hashlist.erase(_packet_hashlist.begin());
+			if (_packet_hashlist.size() > _hashlist_maxsize) {
+				size_t excess = _packet_hashlist.size() - _hashlist_maxsize;
+				_packet_hashlist.erase(_packet_hashlist.begin(), _packet_hashlist.begin() + excess);
 			}
 
 #ifdef FIREWALL_MODE
 			// Cull the boundary mentioned addresses if it has reached its max size
 			if (_boundary_mentioned_addresses.size() > _boundary_maxsize) {
-				std::set<Bytes>::iterator iter = _boundary_mentioned_addresses.begin();
-				std::advance(iter, _boundary_mentioned_addresses.size() - _boundary_maxsize);
-				_boundary_mentioned_addresses.erase(_boundary_mentioned_addresses.begin(), iter);
+				size_t excess = _boundary_mentioned_addresses.size() - _boundary_maxsize;
+				_boundary_mentioned_addresses.erase(_boundary_mentioned_addresses.begin(), _boundary_mentioned_addresses.begin() + excess);
 			}
 
 			// Cull the boundary local addresses if it has reached its max size
 			if (_boundary_local_addresses.size() > _boundary_maxsize) {
-				std::set<Bytes>::iterator iter = _boundary_local_addresses.begin();
-				std::advance(iter, _boundary_local_addresses.size() - _boundary_maxsize);
-				_boundary_local_addresses.erase(_boundary_local_addresses.begin(), iter);
+				size_t excess = _boundary_local_addresses.size() - _boundary_maxsize;
+				_boundary_local_addresses.erase(_boundary_local_addresses.begin(), _boundary_local_addresses.begin() + excess);
 			}
 #endif
 
@@ -669,7 +581,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 							stale_links.push_back(link_id);
 
 							double last_path_request = 0.0;
-							const auto& iter = _path_requests.find(link_entry._destination_hash);
+							const auto& iter = flatmap_find(_path_requests, link_entry._destination_hash);
 							if (iter != _path_requests.end()) {
 								last_path_request = (*iter).second;
 							}
@@ -719,42 +631,45 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 								}
 
 								if (!Reticulum::transport_enabled()) {
-									// Drop current path if we are not a transport instance, to
-									// allow using higher-hop count paths or reused announces
-									// from newly adjacent transport instances.
-									expire_path(link_entry._destination_hash);
+									// Remove the failed outbound interface's path,
+									// leaving backup paths (e.g. LoRa) intact so
+									// select_path() falls through naturally.
+									if (link_entry._outbound_interface) {
+										DEBUG("Removing path to " + link_entry._destination_hash.toHex() + " via " + link_entry._outbound_interface.toString() + " (link establishment failed, backup paths survive)");
+										mark_path_unresponsive(link_entry._destination_hash, link_entry._outbound_interface.get_hash());
+									} else {
+										expire_path(link_entry._destination_hash);
+									}
 								}
 							}
 						}
 					}
 				}
 
-				// Cull the path table
+				// Cull the path table: remove expired entries and empty deques
 				std::vector<Bytes> stale_paths;
-				for (const auto& [destination_hash, destination_entry] : _destination_table) {
-					const Interface& attached_interface = destination_entry.receiving_interface();
-					double destination_expiry;
-					if (attached_interface && attached_interface.mode() == Type::Interface::MODE_ACCESS_POINT) {
-						destination_expiry = destination_entry._timestamp + AP_PATH_TIME;
-					}
-					else if (attached_interface && attached_interface.mode() == Type::Interface::MODE_ROAMING) {
-						destination_expiry = destination_entry._timestamp + ROAMING_PATH_TIME;
-					}
-					else {
-						destination_expiry = destination_entry._timestamp + DESTINATION_TIMEOUT;
-					}
+				{
+					double now = OS::time();
+					for (auto& [destination_hash, deque] : _destination_table) {
+						// Remove expired individual entries
+						deque.erase(std::remove_if(deque.begin(), deque.end(),
+							[now](const PathEntry& e) { return e.is_expired(now); }),
+							deque.end());
 
-					if (OS::time() > destination_expiry) {
-						stale_paths.push_back(destination_hash);
+						// Remove entries whose interface no longer exists
+						deque.erase(std::remove_if(deque.begin(), deque.end(),
+							[](const PathEntry& e) {
+								Interface iface = find_interface_from_hash(e.receiving_interface);
+								return !iface;
+							}), deque.end());
+
+						if (deque.empty()) {
+							stale_paths.push_back(destination_hash);
+						}
+					}
+					for (const auto& destination_hash : stale_paths) {
+						_destination_table.erase(destination_hash);
 						DEBUG("Path to " + destination_hash.toHex() + " timed out and was removed");
-					}
-					else if (!attached_interface) {
-						stale_paths.push_back(destination_hash);
-						DEBUG("Path to " + destination_hash.toHex() + " was removed since the attached interface is missing");
-					}
-					else if (_interfaces.count(attached_interface.get_hash()) == 0) {
-						stale_paths.push_back(destination_hash);
-						DEBUG("Path to " + destination_hash.toHex() + " was removed since the attached interface no longer exists");
 					}
 				}
 
@@ -767,16 +682,16 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 					}
 				}
 
-				// Cull the path requests table (entries older than destination timeout)
+				// Cull the path requests table (entries only needed for PATH_REQUEST_MI throttling, 20s)
 				{
 					std::vector<Bytes> stale_path_requests;
 					for (const auto& [destination_hash, timestamp] : _path_requests) {
-						if (OS::time() > (timestamp + DESTINATION_TIMEOUT)) {
+						if (OS::time() > (timestamp + PATH_REQUEST_MI * 2)) {
 							stale_path_requests.push_back(destination_hash);
 						}
 					}
 					for (const Bytes& destination_hash : stale_path_requests) {
-						_path_requests.erase(destination_hash);
+						flatmap_erase(_path_requests, destination_hash);
 					}
 				}
 
@@ -784,7 +699,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 				{
 					std::vector<Bytes> stale_plpr;
 					for (const auto& [destination_hash, iface_hash] : _pending_local_path_requests) {
-						if (!iface_hash || _interfaces.count(iface_hash) == 0) {
+						if (_interfaces.count(iface_hash) == 0) {
 							stale_plpr.push_back(destination_hash);
 						}
 					}
@@ -963,11 +878,25 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 
 	// Check if we have a known path for the destination in the path table
     //if packet.packet_type != RNS.Packet.ANNOUNCE and packet.destination.type != RNS.Destination.PLAIN and packet.destination.type != RNS.Destination.GROUP and packet.destination_hash in Transport.destination_table:
-	if (packet.packet_type() != Type::Packet::ANNOUNCE && packet.destination().type() != Type::Destination::PLAIN && packet.destination().type() != Type::Destination::GROUP && _destination_table.find(packet.destination_hash()) != _destination_table.end()) {
+	if (packet.packet_type() != Type::Packet::ANNOUNCE && packet.destination().type() != Type::Destination::PLAIN && packet.destination().type() != Type::Destination::GROUP && has_path(packet.destination_hash())) {
 		TRACE("Transport::outbound: Path to destination is known");
         //outbound_interface = Transport.destination_table[packet.destination_hash][5]
-		DestinationEntry& destination_entry = (*_destination_table.find(packet.destination_hash())).second;
-		Interface outbound_interface = destination_entry.receiving_interface();
+		Interface outbound_interface = next_hop_interface(packet.destination_hash());
+		uint8_t hops = hops_to(packet.destination_hash());
+		Bytes nh = next_hop(packet.destination_hash());
+
+		// Update timestamp on the selected path entry (for LRU culling)
+		{
+			auto iter = _destination_table.find(packet.destination_hash());
+			if (iter != _destination_table.end()) {
+				for (auto& entry : iter->second) {
+					if (!entry.is_expired(OS::time()) && entry.next_hop == nh) {
+						entry.timestamp = OS::time();
+						break;
+					}
+				}
+			}
+		}
 
 		// If there's more than one hop to the destination, and we know
 		// a path, we insert the packet into transport by adding the next
@@ -975,7 +904,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 		// This rule applies both for "normal" transport, and when connected
 		// to a local shared Reticulum instance.
         //if Transport.destination_table[packet.destination_hash][2] > 1:
-		if (destination_entry._hops > 1) {
+		if (hops > 1) {
 			TRACE("Forwarding packet to next closest interface...");
 			if (packet.header_type() == Type::Packet::HEADER_1) {
 				// Insert packet into transport
@@ -983,18 +912,17 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 				uint8_t new_flags = (Type::Packet::HEADER_2) << 6 | (Type::Transport::TRANSPORT) << 4 | (packet.flags() & 0b00001111);
 				// CBA RESERVE
 				//Bytes new_raw;
-				Bytes new_raw(packet.raw().size() + Type::Identity::TRUNCATED_HASHLENGTH/8);
+				Bytes new_raw(512);
 				//new_raw = struct.pack("!B", new_flags)
 				new_raw << new_flags;
 				//new_raw += packet.raw[1:2]
 				new_raw << packet.raw().mid(1,1);
 				//new_raw += Transport.destination_table[packet.destination_hash][1]
-				new_raw << destination_entry._received_from;
+				new_raw << nh;
 				//new_raw += packet.raw[2:]
 				new_raw << packet.raw().mid(2);
 				transmit(outbound_interface, new_raw);
 				//_destination_table[packet.destination_hash][0] = time.time()
-				destination_entry._timestamp = OS::time();
 				sent = true;
 			}
 		}
@@ -1007,7 +935,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 		// are "behind" a shared instance, we need to get that instance
 		// to transport it onto the network.
         //elif Transport.destination_table[packet.destination_hash][2] == 1 and Transport.owner.is_connected_to_shared_instance:
-		else if (destination_entry._hops == 1 && _owner.is_connected_to_shared_instance()) {
+		else if (hops == 1 && _owner.is_connected_to_shared_instance()) {
 			TRACE("Transport::outbound: Sending packet for directly connected interface to shared instance...");
 			if (packet.header_type() == Type::Packet::HEADER_1) {
 				// Insert packet into transport
@@ -1015,18 +943,17 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 				uint8_t new_flags = (Type::Packet::HEADER_2) << 6 | (Type::Transport::TRANSPORT) << 4 | (packet.flags() & 0b00001111);
 				// CBA RESERVE
 				//Bytes new_raw;
-				Bytes new_raw(packet.raw().size() + Type::Identity::TRUNCATED_HASHLENGTH/8);
+				Bytes new_raw(512);
 				//new_raw = struct.pack("!B", new_flags)
 				new_raw << new_flags;
 				//new_raw += packet.raw[1:2]
 				new_raw << packet.raw().mid(1, 1);
 				//new_raw += Transport.destination_table[packet.destination_hash][1]
-				new_raw << destination_entry._received_from;
+				new_raw << nh;
 				//new_raw += packet.raw[2:]
 				new_raw << packet.raw().mid(2);
 				transmit(outbound_interface, new_raw);
 				//Transport.destination_table[packet.destination_hash][0] = time.time()
-				destination_entry._timestamp = OS::time();
 				sent = true;
 			}
 		}
@@ -1283,10 +1210,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 					}
 					if (!stored_hash) {
 						// CBA ACCUMULATES
-						_packet_hashlist.insert(packet.packet_hash());
-						while (_packet_hashlist.size() > _hashlist_maxsize) {
-							_packet_hashlist.erase(_packet_hashlist.begin());
-						}
+						_packet_hashlist.push_back(packet.packet_hash());
 						stored_hash = true;
 					}
 
@@ -1397,7 +1321,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 		}
 	}
 
-	if (_packet_hashlist.find(packet.packet_hash()) == _packet_hashlist.end()) {
+	if (std::find(_packet_hashlist.begin(), _packet_hashlist.end(), packet.packet_hash()) == _packet_hashlist.end()) {
 		TRACE("Transport::packet_filter: packet not previously seen");
 		return true;
 	}
@@ -1543,18 +1467,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 	packet.receiving_interface(interface);
 	packet.hops(packet.hops() + 1);
 
-#ifdef FIREWALL_MODE
-	Bytes log_destination = boundary_log_destination(packet);
-	std::string packet_destination_label = boundary_hash_label(packet.destination_hash());
-	std::string log_destination_label = boundary_hash_label(log_destination);
-	VERBOSEF("[PKT] IN iface=%s sz=%u type=%u ctx=%u hdr=%u dstt=%u hops=%u dst=%s ref=%s%s tid=%s",
-		interface.toString().c_str(), (unsigned)raw.size(), (unsigned)packet.packet_type(),
-		(unsigned)packet.context(), (unsigned)packet.header_type(), (unsigned)packet.destination_type(),
-		(unsigned)packet.hops(), packet_destination_label.c_str(), log_destination_label.c_str(),
-		packet_whitelist_annotation(packet),
-		packet.transport_id() ? packet.transport_id().toHex().substr(0,8).c_str() : "none");
-#endif
-
 // TODO
 /*p
 	if (interface) {
@@ -1601,27 +1513,18 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 	if (accept) {
 		accept = packet_filter(packet);
 	}
-	else {
-#ifdef FIREWALL_MODE
-		VERBOSEF("[PKT] DROP callback dst=%s ref=%s%s type=%u ctx=%u",
-			packet_destination_label.c_str(), log_destination_label.c_str(),
-			packet_whitelist_annotation(packet),
-			(unsigned)packet.packet_type(), (unsigned)packet.context());
-#endif
-	}
 	if (accept) {
 		TRACE("Transport::inbound: Packet accepted by filter");
 
-		// FIREWALL MODE: Comprehensive firewall for untrusted ingress.
+		// BOUNDARY MODE: Comprehensive firewall for backbone traffic.
 		//
 		// Three rules:
-		//   1. Addresses that touch trusted local interfaces get whitelisted.
-		//   2. Untrusted traffic is admitted only if any packet-carried address
-		//      is already whitelisted or locally owned, or the packet belongs to
-		//      established reverse/link/control state.
-		//   3. Untrusted announces never get an ingress bypass. If their
-		//      referenced destination is not already whitelisted, they are
-		//      dropped before further handling.
+		//   1. Addresses that touch local interfaces (RNode/LoRa, LocalTCP)
+		//      get whitelisted on the backbone interface.
+		//   2. Every packet referencing a whitelisted address — ALL identifiers
+		//      in that packet also get whitelisted (link hashes, announces,
+		//      requests, proofs, truncated hashes, transport IDs, EVERYTHING).
+		//   3. Everything else gets blocked on the backbone interface.
 		//
 		// Note on ratchets: ratchet public keys are embedded in announce
 		// payloads and flow through unchanged since we forward the entire
@@ -1630,30 +1533,28 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 		// handling is needed here.
 #ifdef FIREWALL_MODE
 		{
-			bool is_untrusted_ingress = is_boundary_untrusted_interface(packet.receiving_interface());
-			bool is_announce = packet.packet_type() == Type::Packet::ANNOUNCE;
-			Bytes referenced_destination = log_destination;
-			if (is_untrusted_ingress) {
-				// === UNTRUSTED PACKET: gate against all packet-carried addresses ===
+			bool is_backbone = is_backbone_interface(packet.receiving_interface());
+			if (is_backbone) {
+				// === BACKBONE PACKET: gate against all whitelists ===
 				bool allowed = false;
-				// If the packet carries any address that is already whitelisted or
-				// locally owned, it is relevant to the LAN side and may proceed.
-				if (packet_contains_whitelisted_address(packet)) {
+				// Whitelist 1: destination is a local device
+				if (std::find(_boundary_local_addresses.begin(), _boundary_local_addresses.end(), packet.destination_hash()) != _boundary_local_addresses.end()) {
+					allowed = true;
+				}
+				// Whitelist 2: destination was mentioned by a local device
+				else if (std::find(_boundary_mentioned_addresses.begin(), _boundary_mentioned_addresses.end(), packet.destination_hash()) != _boundary_mentioned_addresses.end()) {
 					allowed = true;
 				}
 				// Return traffic: proofs routed via reverse_table
-				else if (_reverse_table.find(packet.destination_hash()) != _reverse_table.end()) {
+				else if (flatmap_find(_reverse_table, packet.destination_hash()) != _reverse_table.end()) {
 					allowed = true;
 				}
 				// Return traffic: link proofs and link data via link_table
 				else if (_link_table.find(packet.destination_hash()) != _link_table.end()) {
 					allowed = true;
 				}
-				// Internal control destinations other than path.request still match
-				// by their control hash. path.request is handled above via the
-				// requested destination in the payload.
-				else if (_control_hashes.find(packet.destination_hash()) != _control_hashes.end()
-				         && !is_path_request_control_packet(packet)) {
+				// Our own control destinations (path requests, tunnel synthesize)
+				else if (_control_hashes.find(packet.destination_hash()) != _control_hashes.end()) {
 					allowed = true;
 				}
 				// Our own registered destinations
@@ -1668,23 +1569,37 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 					allowed = true;
 				}
 				if (!allowed) {
-					VERBOSEF("[PKT] DROP boundary dst=%s ref=%s%s type=%u ctx=%u hdr=%u",
-						packet_destination_label.c_str(), log_destination_label.c_str(),
-						packet_whitelist_annotation(packet),
-						(unsigned)packet.packet_type(), (unsigned)packet.context(), (unsigned)packet.header_type());
-					DEBUG("BOUNDARY: BLOCKED backbone pkt dest=" + packet_destination_label + " ref=" + log_destination_label + std::string(packet_whitelist_annotation(packet)) + " type=" + std::to_string(packet.packet_type()) + " ctx=" + std::to_string(packet.context()) + " hdr=" + std::to_string(packet.header_type()));
+					DEBUG(" BLOCKED backbone pkt dest=" + packet.destination_hash().toHex().substr(0,8) + " type=" + std::to_string(packet.packet_type()) + " ctx=" + std::to_string(packet.context()) + " hdr=" + std::to_string(packet.header_type()));
 					return;
 				}
+				// === TRANSITIVE WHITELIST ===
+				// Extract ALL identifiers from this allowed backbone packet
+				// so that future related traffic (proofs, link data, return
+				// packets) will also pass through the filter.
+				_boundary_mentioned_addresses.push_back(packet.destination_hash());
+				if (packet.header_type() == Type::Packet::HEADER_2 && packet.transport_id()) {
+					_boundary_mentioned_addresses.push_back(packet.transport_id());
+				}
+				if (packet.packet_type() == Type::Packet::LINKREQUEST) {
+					_boundary_mentioned_addresses.push_back(Link::link_id_from_lr_packet(packet));
+				}
+				_boundary_mentioned_addresses.push_back(packet.getTruncatedHash());
 			}
 			else {
-				// Every destination the LAN mentions becomes whitelisted. Announce
-				// destinations are also tracked as directly-local addresses.
-				if (is_announce) {
-					_boundary_local_addresses.insert(packet.destination_hash());
+				// === LOCAL DEVICE PACKET ===
+				// Whitelist ALL identifiers from this packet so future
+				// related backbone traffic will be allowed through.
+				// Every identifier that touches a local interface gets
+				// whitelisted on the backbone — link hashes, announces,
+				// requests, proofs, EVERYTHING.
+				_boundary_mentioned_addresses.push_back(packet.destination_hash());
+				if (packet.header_type() == Type::Packet::HEADER_2 && packet.transport_id()) {
+					_boundary_mentioned_addresses.push_back(packet.transport_id());
 				}
-				if (referenced_destination) {
-					_boundary_mentioned_addresses.insert(referenced_destination);
+				if (packet.packet_type() == Type::Packet::LINKREQUEST) {
+					_boundary_mentioned_addresses.push_back(Link::link_id_from_lr_packet(packet));
 				}
+				_boundary_mentioned_addresses.push_back(packet.getTruncatedHash());
 			}
 		}
 #endif
@@ -1722,10 +1637,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 
 		if (remember_packet_hash) {
 			// CBA ACCUMULATES
-			_packet_hashlist.insert(packet.packet_hash());
-			while (_packet_hashlist.size() > _hashlist_maxsize) {
-				_packet_hashlist.erase(_packet_hashlist.begin());
-			}
+			_packet_hashlist.push_back(packet.packet_hash());
 		}
 		cache_packet(packet);
 
@@ -1740,7 +1652,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 		// Check special conditions for local clients connected
 		// through a shared Reticulum instance
 		//p from_local_client         = (packet.receiving_interface in Transport.local_client_interfaces)
-		bool from_local_client         = is_local_client_interface(packet.receiving_interface());
+		bool from_local_client         = (_local_client_interfaces.find(packet.receiving_interface()) != _local_client_interfaces.end());
 		//p for_local_client          = (packet.packet_type != RNS.Packet.ANNOUNCE) and (packet.destination_hash in Transport.destination_table and Transport.destination_table[packet.destination_hash][2] == 0)
 		//p for_local_client_link     = (packet.packet_type != RNS.Packet.ANNOUNCE) and (packet.destination_hash in Transport.link_table and Transport.link_table[packet.destination_hash][4] in Transport.local_client_interfaces)
 		//p for_local_client_link    |= (packet.packet_type != RNS.Packet.ANNOUNCE) and (packet.destination_hash in Transport.link_table and Transport.link_table[packet.destination_hash][2] in Transport.local_client_interfaces)
@@ -1749,22 +1661,17 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 		bool for_local_client = false;
 		bool for_local_client_link = false;
 		if (packet.packet_type() != Type::Packet::ANNOUNCE) {
-			auto destination_iter = _destination_table.find(packet.destination_hash());
-			if (destination_iter != _destination_table.end()) {
-				DestinationEntry destination_entry = (*destination_iter).second;
-			 	if (destination_entry._hops == 0) {
-					// Destined for a local destination
-					for_local_client = true;
-				}
+			if (hops_to(packet.destination_hash()) == 0) {
+				for_local_client = true;
 			}
 			auto link_iter = _link_table.find(packet.destination_hash());
 			if (link_iter != _link_table.end()) {
 				LinkEntry link_entry = (*link_iter).second;
-			 	if (is_local_client_interface(link_entry._receiving_interface)) {
+			 	if (_local_client_interfaces.find(link_entry._receiving_interface) != _local_client_interfaces.end()) {
 					// Destined for a local link
 					for_local_client_link = true;
 				}
-			 	if (is_local_client_interface(link_entry._outbound_interface)) {
+			 	if (_local_client_interfaces.find(link_entry._outbound_interface) != _local_client_interfaces.end()) {
 					// Destined for a local link
 					for_local_client_link = true;
 				}
@@ -1774,10 +1681,10 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 		// Determine if packet is proof for local destination???
 		//p proof_for_local_client    = (packet.destination_hash in Transport.reverse_table) and (Transport.reverse_table[packet.destination_hash][0] in Transport.local_client_interfaces)
 		bool proof_for_local_client = false;
-		auto reverse_iter = _reverse_table.find(packet.destination_hash());
+		auto reverse_iter = flatmap_find(_reverse_table, packet.destination_hash());
 		if (reverse_iter != _reverse_table.end()) {
 			ReverseEntry reverse_entry = (*reverse_iter).second;
-			if (is_local_client_interface(reverse_entry._receiving_interface)) {
+			if (_local_client_interfaces.find(reverse_entry._receiving_interface) != _local_client_interfaces.end()) {
 				// Proof for local destination???
 				proof_for_local_client = true;
 			}
@@ -1851,12 +1758,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 					TRACE("Transport::inbound: Cached packet");
 					return;
 				}
-#ifdef FIREWALL_MODE
-				if (is_backbone_interface(packet.receiving_interface())) {
-					TRACE("BOUNDARY: Dropping unsatisfied backbone cache request");
-					return;
-				}
-#endif
 			}
 
 			// If the packet is in transport, check whether we
@@ -1866,16 +1767,19 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 				TRACE("Transport::inbound: Packet is in transport...");
 				if (packet.transport_id() == _identity.hash()) {
 					TRACE("Transport::inbound: We are designated next-hop");
-					auto destination_iter = _destination_table.find(packet.destination_hash());
-					if (destination_iter != _destination_table.end()) {
+					if (has_path(packet.destination_hash())) {
 						TRACE("Transport::inbound: Found next-hop path to destination");
-						DestinationEntry& destination_entry = (*destination_iter).second;
-						Bytes next_hop = destination_entry._received_from;
-						uint8_t remaining_hops = destination_entry._hops;
+						const PathEntry* entry = select_path(packet.destination_hash());
+						if (!entry) {
+							TRACE("Got packet in transport, but selected path expired. Dropping packet.");
+							return;
+						}
+						Bytes next_hop = entry->next_hop;
+						uint8_t remaining_hops = entry->hops;
 						
 						// CBA RESERVE
 						//Bytes new_raw;
-						Bytes new_raw(packet.raw().size());
+						Bytes new_raw(512);
 						if (remaining_hops > 1) {
 							// Just increase hop count and transmit
 							//new_raw  = packet.raw[0:1]
@@ -1903,15 +1807,15 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 							//new_raw  = packet.raw[0:1]
 							new_raw << packet.raw().left(1);
 							//new_raw += struct.pack("!B", packet.hops)
-							new_raw << (is_local_client_interface(destination_entry.receiving_interface()) ? (uint8_t)0 : packet.hops());
+							new_raw << packet.hops();
 							//new_raw += packet.raw[2:]
 							new_raw << packet.raw().mid(2);
 						}
 
-						Interface outbound_interface = destination_entry.receiving_interface();
+						Interface outbound_interface = find_interface_from_hash(entry->receiving_interface);
 
 #ifdef FIREWALL_MODE
-						// In firewall mode, never route a packet from backbone back to backbone.
+						// In boundary mode, never route a packet from backbone back to backbone.
 						// The upstream server sent us this packet because we are the next hop,
 						// so the destination must be on our local side.
 						if (is_backbone_interface(packet.receiving_interface()) && is_backbone_interface(outbound_interface)) {
@@ -1965,11 +1869,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 							);
 							// CBA ACCUMULATES
 							_link_table.insert({Link::link_id_from_lr_packet(packet), link_entry});
-							VERBOSEF("[LINK] CREATE dst=%s%s link=%s rem=%u recv=%s out=%s lt=%u",
-								packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet),
-								Link::link_id_from_lr_packet(packet).toHex().substr(0,8).c_str(),
-								(unsigned)remaining_hops, packet.receiving_interface().toString().c_str(),
-								outbound_interface.toString().c_str(), (unsigned)_link_table.size());
 						}
 						else {
 							TRACE("Transport::inbound: Packet is next-hop other type");
@@ -1979,7 +1878,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 								OS::time()
 							);
 							// CBA ACCUMULATES
-							_reverse_table.insert({packet.getTruncatedHash(), reverse_entry});
+							flatmap_erase(_reverse_table, packet.getTruncatedHash()); _reverse_table.push_back({packet.getTruncatedHash(), reverse_entry});
 						}
 						TRACE("Transport::outbound: Sending packet to next hop...");
 #if defined(INTERFACES_SET)
@@ -1987,18 +1886,29 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 #else
 						transmit(outbound_interface, new_raw);
 #endif
-						destination_entry._timestamp = OS::time();
-						} // firewall mode else
+						// Update timestamp on the selected path entry
+						{
+							auto iter = _destination_table.find(packet.destination_hash());
+							if (iter != _destination_table.end()) {
+								for (auto& e : iter->second) {
+									if (e.packet_hash == entry->packet_hash) {
+										e.timestamp = OS::time();
+										break;
+									}
+								}
+							}
+						}
+						} // boundary mode else
 					}
 					else {
 #ifdef FIREWALL_MODE
-						// FIREWALL MODE: No path to destination. If packet came from
+						// BOUNDARY MODE: No path to destination. If packet came from
 						// a local device (non-backbone), request the path — but only if
 						// this isn't a link_id (link data is handled by link transport).
 						{
 							bool from_backbone = is_backbone_interface(packet.receiving_interface());
 							if (!from_backbone && _link_table.find(packet.destination_hash()) == _link_table.end()) {
-								DEBUG("BOUNDARY: No path to " + packet.destination_hash().toHex() + " for local device packet. Requesting path.");
+								DEBUG(" No path to " + packet.destination_hash().toHex() + " for local device packet. Requesting path.");
 								request_path(packet.destination_hash());
 							}
 						}
@@ -2017,7 +1927,7 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 			else {
 				TRACE("Transport::inbound: Either packet is announce or packet has no next-hop (possibly for a local destination)");
 #ifdef FIREWALL_MODE
-				// FIREWALL MODE: If this packet came from a local interface and we
+				// BOUNDARY MODE: If this packet came from a local interface and we
 				// have a path to the destination, wrap it with transport headers
 				// and forward it through the backbone as the first transport hop.
 				// Skip ANNOUNCE and PROOF packets — announces have their own handling,
@@ -2035,16 +1945,15 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 				if (!is_local_destination && packet.packet_type() != Type::Packet::ANNOUNCE && packet.packet_type() != Type::Packet::PROOF) {
 					bool is_from_backbone = is_backbone_interface(packet.receiving_interface());
 					if (!is_from_backbone) {
-						auto destination_iter = _destination_table.find(packet.destination_hash());
-						if (destination_iter != _destination_table.end()) {
-							DestinationEntry& dest_entry = (*destination_iter).second;
-							Bytes next_hop = dest_entry._received_from;
-							uint8_t remaining_hops = dest_entry._hops;
-							Interface outbound_interface = dest_entry.receiving_interface();
+						const PathEntry* entry = select_path(packet.destination_hash());
+						if (entry) {
+							Bytes next_hop = entry->next_hop;
+							uint8_t remaining_hops = entry->hops;
+							Interface outbound_interface = find_interface_from_hash(entry->receiving_interface);
 
 							// Build outgoing packet based on remaining hops,
 							// mirroring standard transport forwarding logic.
-							Bytes new_raw(packet.raw().size() + Type::Identity::TRUNCATED_HASHLENGTH/8);
+							Bytes new_raw(512);
 							if (remaining_hops > 1) {
 								// Multi-hop: wrap with HEADER_2/TRANSPORT,
 								// setting transport_id = next_hop (the next
@@ -2101,55 +2010,60 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 								);
 								// Each LINKREQUEST gets its own entry (unique link_id)
 								_link_table.insert({Link::link_id_from_lr_packet(packet), link_entry});
-								VERBOSEF("[LINK] CREATE local dst=%s%s link=%s rem=%u recv=%s out=%s lt=%u",
-									packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet),
-									Link::link_id_from_lr_packet(packet).toHex().substr(0,8).c_str(),
-									(unsigned)remaining_hops, packet.receiving_interface().toString().c_str(),
-									outbound_interface.toString().c_str(), (unsigned)_link_table.size());
 							}
 							else {
 								ReverseEntry reverse_entry(
 									packet.receiving_interface(), outbound_interface, OS::time()
 								);
-								_reverse_table.insert({packet.getTruncatedHash(), reverse_entry});
+								flatmap_erase(_reverse_table, packet.getTruncatedHash()); _reverse_table.push_back({packet.getTruncatedHash(), reverse_entry});
 							}
 
-							DEBUG("BOUNDARY: Forwarding local packet (" + std::to_string(remaining_hops) + " hops, " + std::to_string(new_raw.size()) + " bytes) to " + outbound_interface.toString() + " for " + packet.destination_hash().toHex());
+							DEBUG(" Forwarding local packet (" + std::to_string(remaining_hops) + " hops, " + std::to_string(new_raw.size()) + " bytes) to " + outbound_interface.toString() + " for " + packet.destination_hash().toHex());
 							transmit(outbound_interface, new_raw);
-							dest_entry._timestamp = OS::time();
+							// Update timestamp on selected path entry
+							{
+								auto iter = _destination_table.find(packet.destination_hash());
+								if (iter != _destination_table.end()) {
+									for (auto& e : iter->second) {
+										if (e.packet_hash == entry->packet_hash) {
+											e.timestamp = OS::time();
+											break;
+										}
+									}
+								}
+							}
 						}
 						else {
 							// Only request path if the destination is not a link_id
 							// (link data packets are handled by link transport below,
 							// not by standard transport path lookup).
 							if (_link_table.find(packet.destination_hash()) == _link_table.end()) {
-								DEBUG("BOUNDARY: No path to " + packet.destination_hash().toHex() + " for local packet. Requesting path.");
+								DEBUG(" No path to " + packet.destination_hash().toHex() + " for local packet. Requesting path.");
 								request_path(packet.destination_hash());
 							}
 						}
 					}
 					else {
-						// FIREWALL MODE REVERSE: Packet came from backbone,
+						// BOUNDARY MODE REVERSE: Packet came from backbone,
 						// check if destination is a local LoRa device and forward it.
-						if (_boundary_local_addresses.find(packet.destination_hash()) != _boundary_local_addresses.end()) {
-							auto destination_iter = _destination_table.find(packet.destination_hash());
-							if (destination_iter != _destination_table.end()) {
-								DestinationEntry& dest_entry = (*destination_iter).second;
-								Bytes next_hop = dest_entry._received_from;
-								uint8_t remaining_hops = dest_entry._hops;
-								Interface outbound_interface = dest_entry.receiving_interface();
+						if (std::find(_boundary_local_addresses.begin(), _boundary_local_addresses.end(), packet.destination_hash()) != _boundary_local_addresses.end()) {
+							const PathEntry* entry2 = select_path(packet.destination_hash());
+							if (entry2) {
+								Bytes next_hop2 = entry2->next_hop;
+								uint8_t remaining_hops2 = entry2->hops;
+								Interface outbound_interface2 = find_interface_from_hash(entry2->receiving_interface);
 
 								// Build properly routed packet based on remaining hops,
 								// mirroring the standard transport forwarding logic.
-								Bytes new_raw(packet.raw().size() + Type::Identity::TRUNCATED_HASHLENGTH/8);
-								if (remaining_hops > 1) {
+								Bytes new_raw(512);
+								if (remaining_hops2 > 1) {
 									// Multi-hop: wrap with HEADER_2/TRANSPORT
 									uint8_t new_flags = (Type::Packet::HEADER_2) << 6
 										| (Type::Transport::TRANSPORT) << 4
 										| (packet.flags() & 0b00001111);
 									new_raw << new_flags;
 									new_raw << packet.hops();
-									new_raw << next_hop;            // transport_id
+									new_raw << next_hop2;           // transport_id
 									new_raw << packet.raw().mid(2); // destination_hash + payload
 								}
 								else {
@@ -2163,16 +2077,16 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 								if (packet.packet_type() == Type::Packet::LINKREQUEST) {
 									double now = OS::time();
 									double proof_timeout = now + Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP
-										* std::max((uint8_t)1, remaining_hops);
+										* std::max((uint8_t)1, remaining_hops2);
 
 									// === MTU Clamping (v1.0.12) ===
 									uint16_t path_mtu = Link::mtu_from_lr_packet(packet);
 									if (path_mtu > 0) {
 										uint16_t ph_mtu = packet.receiving_interface().HW_MTU();
-										uint16_t nh_mtu = outbound_interface.HW_MTU();
+										uint16_t nh_mtu = outbound_interface2.HW_MTU();
 										if (nh_mtu == 0) {
 											new_raw = new_raw.left(new_raw.size() - Type::Link::LINK_MTU_SIZE);
-										} else if (!outbound_interface.AUTOCONFIGURE_MTU() && !outbound_interface.FIXED_MTU()) {
+										} else if (!outbound_interface2.AUTOCONFIGURE_MTU() && !outbound_interface2.FIXED_MTU()) {
 											new_raw = new_raw.left(new_raw.size() - Type::Link::LINK_MTU_SIZE);
 										} else if (nh_mtu < path_mtu || (ph_mtu > 0 && ph_mtu < path_mtu)) {
 											uint16_t clamped = std::min(nh_mtu, (ph_mtu > 0) ? ph_mtu : nh_mtu);
@@ -2184,28 +2098,34 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 									}
 
 									LinkEntry link_entry(
-										now, next_hop, outbound_interface, remaining_hops,
+										now, next_hop2, outbound_interface2, remaining_hops2,
 										packet.receiving_interface(), packet.hops(),
 										packet.destination_hash(), false, proof_timeout
 									);
 									_link_table.insert({Link::link_id_from_lr_packet(packet), link_entry});
-									DEBUG("BOUNDARY: Created link_table entry for backbone LINKREQUEST, link_id=" + Link::link_id_from_lr_packet(packet).toHex());
-									VERBOSEF("[LINK] CREATE backbone dst=%s%s link=%s rem=%u recv=%s out=%s lt=%u",
-										packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet),
-										Link::link_id_from_lr_packet(packet).toHex().substr(0,8).c_str(),
-										(unsigned)remaining_hops, packet.receiving_interface().toString().c_str(),
-										outbound_interface.toString().c_str(), (unsigned)_link_table.size());
+									DEBUG(" Created link_table entry for backbone LINKREQUEST, link_id=" + Link::link_id_from_lr_packet(packet).toHex());
 								}
 								else {
 									ReverseEntry reverse_entry(
-										packet.receiving_interface(), outbound_interface, OS::time()
+										packet.receiving_interface(), outbound_interface2, OS::time()
 									);
-									_reverse_table.insert({packet.getTruncatedHash(), reverse_entry});
+									flatmap_erase(_reverse_table, packet.getTruncatedHash()); _reverse_table.push_back({packet.getTruncatedHash(), reverse_entry});
 								}
 
-								DEBUG("BOUNDARY: Forwarding backbone packet (" + std::to_string(remaining_hops) + " hops) to local device for " + packet.destination_hash().toHex() + " via " + outbound_interface.toString());
-								transmit(outbound_interface, new_raw);
-								dest_entry._timestamp = OS::time();
+								DEBUG(" Forwarding backbone packet (" + std::to_string(remaining_hops2) + " hops) to local device for " + packet.destination_hash().toHex() + " via " + outbound_interface2.toString());
+								transmit(outbound_interface2, new_raw);
+								// Update timestamp on selected path entry
+								{
+									auto iter = _destination_table.find(packet.destination_hash());
+									if (iter != _destination_table.end()) {
+										for (auto& e : iter->second) {
+											if (e.packet_hash == entry2->packet_hash) {
+												e.timestamp = OS::time();
+												break;
+											}
+										}
+									}
+								}
 							}
 						}
 					}
@@ -2222,11 +2142,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 					DEBUG("LINK-XPORT: pkt for " + packet.destination_hash().toHex().substr(0,8) + " type=" + std::to_string(packet.packet_type()) + " ctx=" + std::to_string(packet.context()) + " hops=" + std::to_string(packet.hops()) + " from=" + packet.receiving_interface().toString() + " hdr=" + std::to_string(packet.header_type()) + " sz=" + std::to_string(packet.raw().size()));
 					LinkEntry& link_entry = (*link_iter).second;
 					DEBUG("LINK-XPORT: entry hops=" + std::to_string(link_entry._hops) + " rem=" + std::to_string(link_entry._remaining_hops) + " recv=" + link_entry._receiving_interface.toString() + " out=" + link_entry._outbound_interface.toString() + " val=" + std::to_string(link_entry._validated));
-					VERBOSEF("[LINK] XPORT pkt=%s%s type=%u ctx=%u hops=%u recv=%s entry_recv=%s entry_out=%s rem=%u taken=%u val=%u",
-						packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), (unsigned)packet.packet_type(),
-						(unsigned)packet.context(), (unsigned)packet.hops(), packet.receiving_interface().toString().c_str(),
-						link_entry._receiving_interface.toString().c_str(), link_entry._outbound_interface.toString().c_str(),
-						(unsigned)link_entry._remaining_hops, (unsigned)link_entry._hops, link_entry._validated ? 1 : 0);
 					// If receiving and outbound interface is
 					// the same for this link, direction doesn't
 					// matter, and we simply send the packet on.
@@ -2268,17 +2183,13 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 
 					if (outbound_interface) {
 						DEBUG("LINK-XPORT: FWD to " + outbound_interface.toString());
-						VERBOSEF("[LINK] FWD dst=%s%s to=%s size=%u", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), outbound_interface.toString().c_str(), (unsigned)packet.raw().size());
 						// Add this packet to the filter hashlist now that
 						// we have determined it's actually our turn to
 						// process it (matching Python Transport line 1544).
-						_packet_hashlist.insert(packet.packet_hash());
-						while (_packet_hashlist.size() > _hashlist_maxsize) {
-							_packet_hashlist.erase(_packet_hashlist.begin());
-						}
+						_packet_hashlist.push_back(packet.packet_hash());
 						// CBA RESERVE
 						//Bytes new_raw;
-						Bytes new_raw(packet.raw().size());
+						Bytes new_raw(512);
 						//new_raw = packet.raw[0:1]
 						new_raw << packet.raw().left(1);
 						//new_raw += struct.pack("!B", packet.hops)
@@ -2290,7 +2201,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 					}
 					else {
 						DEBUG("LINK-XPORT: DROPPED (no outbound interface resolved)");
-						VERBOSEF("[LINK] DROP dst=%s%s recv=%s rem=%u taken=%u pkt_hops=%u", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), packet.receiving_interface().toString().c_str(), (unsigned)link_entry._remaining_hops, (unsigned)link_entry._hops, (unsigned)packet.hops());
 					}
 				}
 			}
@@ -2307,11 +2217,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 			TRACE("Transport::inbound: Packet is ANNOUNCE");
 			DEBUG("DIAG: ANNOUNCE-IN dest=" + packet.destination_hash().toHex().substr(0,8) + " iface=" + packet.receiving_interface().toString() + " hops=" + std::to_string(packet.hops()));
 			Bytes received_from;
-			bool announce_valid = Identity::validate_announce(packet);
-			VERBOSEF("[ANNC] IN dst=%s%s valid=%u ctx=%u hops=%u iface=%s data=%u",
-				packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), announce_valid ? 1 : 0,
-				(unsigned)packet.context(), (unsigned)packet.hops(),
-				packet.receiving_interface().toString().c_str(), (unsigned)packet.data().size());
 			//p local_destination = next((d for d in Transport.destinations if d.hash == packet.destination_hash), None)
 #if defined(DESTINATIONS_SET)
 			//Destination local_destination({Type::NONE});
@@ -2325,10 +2230,10 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 			}
             //if local_destination == None and RNS.Identity.validate_announce(packet): 
 			//if (!local_destination && Identity::validate_announce(packet)) {
-			if (!found_local && announce_valid) {
+			if (!found_local && Identity::validate_announce(packet)) {
 #elif defined(DESTINATIONS_MAP)
 			auto iter = _destinations.find(packet.destination_hash());
-			if (iter == _destinations.end() && announce_valid) {
+			if (iter == _destinations.end() && Identity::validate_announce(packet)) {
 #endif
 				TRACE("Transport::inbound: Packet is announce for non-local destination, processing...");
 				if (packet.transport_id()) {
@@ -2384,84 +2289,21 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 				auto iter = _destinations.find(packet.destination_hash());
 				if (iter == _destinations.end() && packet.hops() < (PATHFINDER_M+1)) {
 #endif
-					uint64_t announce_emitted = Transport::announce_emitted(packet);
-
-					//p random_blob = packet.data[RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8:RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8+10]
+					// ── Multi-Path Path Table Insertion ──────────────────────
+					// 2 leaf outcomes instead of 11: replay check only.
+					// All valid announces coexist; select_path() picks best at forwarding time.
 					Bytes random_blob = packet.data().mid(Type::Identity::KEYSIZE/8 + Type::Identity::NAME_HASH_LENGTH/8, Type::Identity::RANDOM_HASH_LENGTH/8);
-					//p random_blobs = []
-					std::set<Bytes> empty_random_blobs;
-					std::set<Bytes>& random_blobs = empty_random_blobs;
-					auto iter = _destination_table.find(packet.destination_hash());
-					if (iter != _destination_table.end()) {
-						DestinationEntry destination_entry = (*iter).second;
-						//p random_blobs = Transport.destination_table[packet.destination_hash][4]
-						random_blobs = destination_entry._random_blobs;
 
-						// If we already have a path to the announced
-						// destination, but the hop count is equal or
-						// less, we'll update our tables.
-						if (packet.hops() <= destination_entry._hops) {
-							// Make sure we haven't heard the random
-							// blob before, so announces can't be
-							// replayed to forge paths.
-							// TODO: Check whether this approach works
-							// under all circumstances
-							//p if not random_blob in random_blobs:
-							if (random_blobs.find(random_blob) == random_blobs.end()) {
-								should_add = true;
-							}
-							else {
-								should_add = false;
-							}
-						}
-						else {
-							// If an announce arrives with a larger hop
-							// count than we already have in the table,
-							// ignore it, unless the path is expired, or
-							// the emission timestamp is more recent.
-							double now = OS::time();
-							double path_expires = destination_entry._expires;
-							
-							uint64_t path_announce_emitted = 0;
-							for (const Bytes& path_random_blob : random_blobs) {
-								//p path_announce_emitted = max(path_announce_emitted, int.from_bytes(path_random_blob[5:10], "big"))
-								path_announce_emitted = std::max(path_announce_emitted, OS::from_bytes_big_endian(path_random_blob.data() + 5, 5));
-								if (path_announce_emitted >= announce_emitted) {
-									break;
-								}
-							}
-
-							if (now >= path_expires) {
-								// We also check that the announce is
-								// different from ones we've already heard,
-								// to avoid loops in the network
-								if (random_blobs.find(random_blob) == random_blobs.end()) {
-									// TODO: Check that this ^ approach actually
-									// works under all circumstances
-									DEBUG("Replacing destination table entry for " + packet.destination_hash().toHex() + " with new announce due to expired path");
-									should_add = true;
-								}
-								else {
-									should_add = false;
-								}
-							}
-							else {
-								if (announce_emitted > path_announce_emitted) {
-									if (random_blobs.find(random_blob) == random_blobs.end()) {
-										DEBUG("Replacing destination table entry for " + packet.destination_hash().toHex() + " with new announce, since it was more recently emitted");
-										should_add = true;
-									}
-									else {
-										should_add = false;
-									}
-								}
-							}
-						}
-					}
-					else {
-						// If this destination is unknown in our table
-						// we should add it
+					// Step 1: Anti-replay via global blob set
+					if (std::find(_global_blobs.begin(), _global_blobs.end(), random_blob) != _global_blobs.end()) {
+						should_add = false;
+					} else {
 						should_add = true;
+						_global_blobs.push_back(random_blob);
+						// Cap global_blobs at MAX_GLOBAL_BLOBS (FIFO eviction)
+						if (_global_blobs.size() > MAX_GLOBAL_BLOBS) {
+							_global_blobs.erase(_global_blobs.begin());
+						}
 					}
 
 					// NOTE: The boundary-mode announce echo blocking that was here
@@ -2538,43 +2380,55 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 							expires = now + PATHFINDER_E;
 						}
 
-						random_blobs.insert(random_blob);
+						// ── Multi-Path Insertion ────────────────────────────
+						// 1. Build PathEntry from announce fields
+						// 2. Dedup within dest by packet_hash
+						// 3. Push front (newest-first), truncate to MAX_PATHS_PER_DEST
 
-						// Trim random_blobs to prevent unbounded memory growth
-						// (matching Python: random_blobs = random_blobs[-MAX_RANDOM_BLOBS:])
-						if (random_blobs.size() > MAX_RANDOM_BLOBS) {
-							// Keep only the MAX_RANDOM_BLOBS blobs with the highest
-							// timestamps (bytes 5-9 big-endian). Extract, sort by
-							// timestamp desc, keep top N, rebuild set.
-							std::vector<Bytes> blob_vec(random_blobs.begin(), random_blobs.end());
-							std::sort(blob_vec.begin(), blob_vec.end(), [](const Bytes& a, const Bytes& b) {
-								// Sort descending by timestamp (bytes 5-9)
-								uint64_t ts_a = OS::from_bytes_big_endian(a.data() + 5, 5);
-								uint64_t ts_b = OS::from_bytes_big_endian(b.data() + 5, 5);
-								return ts_a > ts_b;
-							});
-							random_blobs.clear();
-							for (size_t i = 0; i < MAX_RANDOM_BLOBS && i < blob_vec.size(); i++) {
-								random_blobs.insert(blob_vec[i]);
-							}
-							TRACEF("Trimmed random_blobs to %d entries for %s", random_blobs.size(), packet.destination_hash().toHex().c_str());
+						TRACE("Caching packet " + packet.get_hash().toHex());
+						if (RNS::Transport::cache_packet(packet, true)) {
+							packet.cached(true);
+						}
+						TRACE("Adding destination " + packet.destination_hash().toHex() + " to path table");
+
+						PathEntry new_entry(
+							now,
+							received_from,
+							announce_hops,
+							expires,
+							packet.receiving_interface().get_hash(),
+							packet.get_hash()
+						);
+
+						auto& deque = _destination_table[packet.destination_hash()];
+						bool is_new_dest = deque.empty();
+
+						// Remove any existing entry with the same packet_hash (same announce)
+						deque.erase(std::remove_if(deque.begin(), deque.end(),
+							[&new_entry](const PathEntry& e) {
+								return e.packet_hash == new_entry.packet_hash;
+							}), deque.end());
+
+						// Prepend newest entry
+						deque.push_front(new_entry);
+
+						// Cap at MAX_PATHS_PER_DEST
+						while (deque.size() > MAX_PATHS_PER_DEST) {
+							deque.pop_back();
 						}
 
-						if ((Reticulum::transport_enabled() || Transport::from_local_client(packet)) && packet.context() != Type::Packet::PATH_RESPONSE) {
-							// Insert announce into announce table for retransmission
+						if (is_new_dest) {
+							++_destinations_added;
+							cull_path_table();
+						}
 
+						// ── Announce table insertion / retransmission ──────
+						if ((Reticulum::transport_enabled() || Transport::from_local_client(packet)) && packet.context() != Type::Packet::PATH_RESPONSE) {
 							if (rate_blocked) {
 								DEBUG("Blocking rebroadcast of announce from " + packet.destination_hash().toHex() + " due to excessive announce rate");
 							}
-#ifdef FIREWALL_MODE
-							else if (is_backbone_interface(packet.receiving_interface())) {
-								DEBUG("BOUNDARY: Suppressing announce rebroadcast queue for " + packet.destination_hash().toHex().substr(0,8));
-							}
-#endif
 							else {
 								if (Transport::from_local_client(packet)) {
-									// If the announce is from a local client,
-									// it is announced immediately, but only one time.
 									retransmit_timeout = now;
 									retries = PATHFINDER_R;
 								}
@@ -2589,99 +2443,40 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 									block_rebroadcasts,
 									attached_interface
 								);
-								// BUG FIX: erase before insert since std::map::insert() is
-								// a no-op when key exists (Python dict assignment overwrites)
 								_announce_table.erase(packet.destination_hash());
 								_announce_table.insert({packet.destination_hash(), announce_entry});
 							}
 						}
-						// TODO: Check from_local_client once and store result
 						else if (Transport::from_local_client(packet) && packet.context() == Type::Packet::PATH_RESPONSE) {
-							// If this is a path response from a local client,
-							// check if any external interfaces have pending
-							// path requests.
-							//p if packet.destination_hash in Transport.pending_local_path_requests:
 							auto iter = _pending_local_path_requests.find(packet.destination_hash());
 							if (iter != _pending_local_path_requests.end()) {
-								//p desiring_interface = Transport.pending_local_path_requests.pop(packet.destination_hash)
-								Interface desiring_interface = find_interface_from_hash((*iter).second);
-								_pending_local_path_requests.erase(iter);  // CBA FIX: pop() equivalent
-								if (desiring_interface) {
-									attached_interface = desiring_interface;
-									retransmit_timeout = now;
-									retries = PATHFINDER_R;
+								_pending_local_path_requests.erase(iter);
+								retransmit_timeout = now;
+								retries = PATHFINDER_R;
 
-									AnnounceEntry announce_entry(
-										now,
-										retransmit_timeout,
-										retries,
-										received_from,
-										announce_hops,
-										packet,
-										local_rebroadcasts,
-										block_rebroadcasts,
-										attached_interface
-									);
-									// BUG FIX: erase before insert since std::map::insert() is
-									// a no-op when key exists (Python dict assignment overwrites)
-									_announce_table.erase(packet.destination_hash());
-									_announce_table.insert({packet.destination_hash(), announce_entry});
-
-#ifdef FIREWALL_MODE
-									Identity announce_identity(Identity::recall(packet.destination_hash()));
-									if (announce_identity && attached_interface) {
-										Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, packet.destination_hash());
-										Packet path_response(
-											announce_destination,
-											attached_interface,
-											packet.data(),
-											Type::Packet::ANNOUNCE,
-											Type::Packet::PATH_RESPONSE,
-											Type::Transport::TRANSPORT,
-											Type::Packet::HEADER_2,
-											_identity.hash(),
-											true,
-											packet.context_flag()
-										);
-										path_response.hops(packet.hops());
-										path_response.send();
-										_announce_table.erase(packet.destination_hash());
-										VERBOSEF("[PATH] RESP local-client dst=%s%s hops=%u to=%s",
-											packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet),
-											(unsigned)packet.hops(), attached_interface.toString().c_str());
-									}
-#endif
-								}
-								else {
-									DEBUG("Dropping local-client path response for " + packet.destination_hash().toHex().substr(0,8) + ", pending requester interface disappeared");
-								}
+								AnnounceEntry announce_entry(
+									now,
+									retransmit_timeout,
+									retries,
+									received_from,
+									announce_hops,
+									packet,
+									local_rebroadcasts,
+									block_rebroadcasts,
+									attached_interface
+								);
+								_announce_table.erase(packet.destination_hash());
+								_announce_table.insert({packet.destination_hash(), announce_entry});
 							}
 						}
 
-						// If we have any local clients connected, we re-
-						// transmit the announce to them immediately. Backbone
-						// announces only cross the boundary once the destination
-						// is already whitelisted or a waiting LAN discovery
-						// request explicitly asked for it.
-						bool allow_local_client_announce = true;
-#ifdef FIREWALL_MODE
-						if (is_boundary_untrusted_interface(packet.receiving_interface())) {
-							allow_local_client_announce =
-								packet.context() == Type::Packet::PATH_RESPONSE ||
-								_discovery_path_requests.find(packet.destination_hash()) != _discovery_path_requests.end() ||
-								boundary_hash_is_whitelisted(packet.destination_hash());
-						}
-#endif
-						if (allow_local_client_announce && _local_client_interfaces.size() > 0) {
+						// ── Forward announce to local clients ─────────────
+						if (_local_client_interfaces.size() > 0) {
 							Identity announce_identity(Identity::recall(packet.destination_hash()));
-							//Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, "unknown", "unknown");
-							//announce_destination.hash(packet.destination_hash());
 							Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, packet.destination_hash());
-							//announce_destination.hexhash(announce_destination.hash().toHex());
 							Type::Packet::context_types announce_context = Type::Packet::CONTEXT_NONE;
 							Bytes announce_data = packet.data();
 
-							// TODO: Shouldn't the context be PATH_RESPONSE in the first case here?
 							if (Transport::from_local_client(packet) && packet.context() == Type::Packet::PATH_RESPONSE) {
 								for (const Interface& local_interface : _local_client_interfaces) {
 									if (packet.receiving_interface() != local_interface) {
@@ -2697,7 +2492,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 											true,
 											packet.context_flag()
 										);
-
 										new_announce.hops(packet.hops());
 										new_announce.send();
 									}
@@ -2718,118 +2512,56 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 											true,
 											packet.context_flag()
 										);
-
 										new_announce.hops(packet.hops());
 										new_announce.send();
 									}
 								}
 							}
 						}
-						else if (_local_client_interfaces.size() > 0 && is_boundary_untrusted_interface(packet.receiving_interface())) {
-							DEBUG("BOUNDARY: Holding untrusted announce " + packet.destination_hash().toHex().substr(0,8) + " until LAN whitelist/discovery asks for it");
-						}
 
-						// If we have any waiting discovery path requests
-						// for this destination, we retransmit to that
-						// interface immediately
-						auto iter = _discovery_path_requests.find(packet.destination_hash());
-						if (iter != _discovery_path_requests.end()) {
-							PathRequestEntry& pr_entry = (*iter).second;
-							attached_interface = pr_entry._requesting_interface;
+						// ── Answer waiting discovery path requests ────────
+						{
+							auto iter = flatmap_find(_discovery_path_requests, packet.destination_hash());
+							if (iter != _discovery_path_requests.end()) {
+								PathRequestEntry& pr_entry = (*iter).second;
+								attached_interface = pr_entry._requesting_interface;
 
-							DEBUG("Got matching announce, answering waiting discovery path request for " + packet.destination_hash().toHex() + " on " + attached_interface.toString());
-							Identity announce_identity(Identity::recall(packet.destination_hash()));
-							//Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, "unknown", "unknown");
-							//announce_destination.hash(packet.destination_hash());
-							Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, packet.destination_hash());
-							//announce_destination.hexhash(announce_destination.hash().toHex());
-							Type::Packet::context_types announce_context = Type::Packet::CONTEXT_NONE;
-							Bytes announce_data = packet.data();
+								DEBUG("Got matching announce, answering waiting discovery path request for " + packet.destination_hash().toHex() + " on " + attached_interface.toString());
+								Identity announce_identity(Identity::recall(packet.destination_hash()));
+								Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, packet.destination_hash());
+								Type::Packet::context_types announce_context = Type::Packet::CONTEXT_NONE;
+								Bytes announce_data = packet.data();
 
-							Packet new_announce(
-								announce_destination,
-								attached_interface,
-								announce_data,
-								Type::Packet::ANNOUNCE,
-								Type::Packet::PATH_RESPONSE,
-								Type::Transport::TRANSPORT,
-								Type::Packet::HEADER_2,
-								_identity.hash(),
-								true,
-								packet.context_flag()
-							);
-
-							new_announce.hops(packet.hops());
-							new_announce.send();
-							VERBOSEF("[PATH] RESP dst=%s%s hops=%u to=%s local=%u",
-								packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet),
-								(unsigned)packet.hops(), attached_interface.toString().c_str(), 0u);
-							_discovery_path_requests.erase(iter);
-						}
-
-						bool buffer_backbone_announce = false;
-						#ifdef FIREWALL_MODE
-						buffer_backbone_announce = is_boundary_untrusted_interface(packet.receiving_interface())
-							&& _discovery_path_requests.find(packet.destination_hash()) == _discovery_path_requests.end()
-							&& !boundary_hash_is_whitelisted(packet.destination_hash());
-						#endif
-
-						if (buffer_backbone_announce) {
-							AnnounceEntry held_announce(
-								now,
-								0,
-								0,
-								received_from,
-								announce_hops,
-								packet,
-								0,
-								true,
-								{Type::NONE}
-							);
-							_held_announces.erase(packet.destination_hash());
-							_held_announces.insert({packet.destination_hash(), held_announce});
-							DEBUG("BOUNDARY: Buffered backbone announce for " + packet.destination_hash().toHex().substr(0,8) + " until trusted discovery requests it");
-						}
-						else {
-							// CBA Culling before adding to esnure table does not exceed maxsize
-							TRACE("Caching packet " + packet.get_hash().toHex());
-							if (RNS::Transport::cache_packet(packet, true)) {
-								packet.cached(true);
+								Packet new_announce(
+									announce_destination,
+									attached_interface,
+									announce_data,
+									Type::Packet::ANNOUNCE,
+									Type::Packet::PATH_RESPONSE,
+									Type::Transport::TRANSPORT,
+									Type::Packet::HEADER_2,
+									_identity.hash(),
+									true,
+									packet.context_flag()
+								);
+								new_announce.hops(packet.hops());
+								new_announce.send();
 							}
-							TRACE("Adding destination " + packet.destination_hash().toHex() + " to path table");
-							DestinationEntry destination_table_entry(
-								now,
-								received_from,
-								announce_hops,
-								expires,
-								random_blobs,
-								packet.receiving_interface().get_hash(),
-								packet.get_hash()
-							);
-							bool path_existed = (_destination_table.erase(packet.destination_hash()) > 0);
-							if (_destination_table.insert({packet.destination_hash(), destination_table_entry}).second) {
-								if (!path_existed) {
-									++_destinations_added;
-									cull_path_table();
-								}
-							}
-							VERBOSEF("[PATH] STORED dst=%s%s hops=%u iface=%s paths=%u bla=%u",
-								packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), (unsigned)announce_hops,
-								packet.receiving_interface().toString().c_str(), (unsigned)_destination_table.size(),
-								(unsigned)_boundary_local_addresses.size());
-
-							DEBUG("Destination " + packet.destination_hash().toHex() + " is now " + std::to_string(announce_hops) + " hops away via " + received_from.toHex() + " on " + packet.receiving_interface().toString());
-							DEBUG("DIAG: STORED path " + packet.destination_hash().toHex().substr(0,8) + " hops=" + std::to_string(announce_hops) + " iface=" + packet.receiving_interface().toString());
-
-							#ifdef FIREWALL_MODE
-							{
-								if (is_boundary_trusted_interface(packet.receiving_interface())) {
-									_boundary_local_addresses.insert(packet.destination_hash());
-									DEBUG("BOUNDARY: Registered local address " + packet.destination_hash().toHex() + " from local interface");
-								}
-							}
-							#endif
 						}
+
+						DEBUG("Destination " + packet.destination_hash().toHex() + " is now " + std::to_string(announce_hops) + " hops away via " + received_from.toHex() + " on " + packet.receiving_interface().toString());
+						DEBUG("DIAG: STORED path " + packet.destination_hash().toHex().substr(0,8) + " hops=" + std::to_string(announce_hops) + " iface=" + packet.receiving_interface().toString());
+
+						// BOUNDARY MODE: Register destinations seen via non-backbone interfaces (Whitelist 1)
+#ifdef FIREWALL_MODE
+						{
+							bool is_backbone = is_backbone_interface(packet.receiving_interface());
+							if (!is_backbone) {
+								_boundary_local_addresses.push_back(packet.destination_hash());
+								DEBUG(" Registered local address " + packet.destination_hash().toHex() + " from local interface");
+							}
+						}
+#endif
 						//TRACE("Transport::inbound: Destination " + packet.destination_hash().toHex() + " has data: " + packet.data().toHex());
 						//TRACE("Transport::inbound: Destination " + packet.destination_hash().toHex() + " has text: " + packet.data().toString());
 
@@ -2892,8 +2624,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 			}
 			else {
 				TRACE("Transport::inbound: Packet is announce for local destination, not processing");
-				VERBOSEF("[ANNC] SKIP dst=%s%s valid=%u reason=local_or_invalid",
-					packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), announce_valid ? 1 : 0);
 			}
 		}
 
@@ -2992,11 +2722,6 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 			TRACE("Transport::inbound: Packet is PROOF");
 			if (packet.context() == Type::Packet::LRPROOF) {
 				TRACE("Transport::inbound: Packet is LINK PROOF");
-				VERBOSEF("[LRPROOF] IN dst=%s%s hops=%u recv=%s in_lt=%u for_lcl=%u from_lcl=%u",
-					packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), (unsigned)packet.hops(),
-					packet.receiving_interface().toString().c_str(),
-					_link_table.find(packet.destination_hash()) != _link_table.end() ? 1 : 0,
-					for_local_client_link ? 1 : 0, from_local_client ? 1 : 0);
 				// This is a link request proof, check if it
 				// needs to be transported
 				if ((Reticulum::transport_enabled() || for_local_client_link || from_local_client) && _link_table.find(packet.destination_hash()) != _link_table.end()) {
@@ -3030,11 +2755,10 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 
 								if (peer_identity.validate(signature, signed_data)) {
 									DEBUG("LRPROOF-XPORT: VALIDATED, forwarding to " + link_entry._receiving_interface.toString());
-									VERBOSEF("[LRPROOF] FWD dst=%s%s to=%s size=%u", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), link_entry._receiving_interface.toString().c_str(), (unsigned)packet.raw().size());
 									//p new_raw = packet.raw[0:1]
 									// CBA RESERVE
 									//Bytes new_raw = packet.raw().left(1);
-									Bytes new_raw(packet.raw().size());
+									Bytes new_raw(512);
 									new_raw << packet.raw().left(1);
 									//p new_raw += struct.pack("!B", packet.hops)
 									new_raw << packet.hops();
@@ -3047,13 +2771,11 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 								}
 								else {
 									DEBUG("LRPROOF-XPORT: INVALID signature for link " + packet.destination_hash().toHex().substr(0,8) + ", dropping proof.");
-									VERBOSEF("[LRPROOF] DROP invalid-signature dst=%s%s", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet));
 								}
 								} // end peer_identity valid
 							}
 							else {
 								DEBUG("LRPROOF-XPORT: UNEXPECTED data_size=" + std::to_string(packet.data().size()) + " (expected " + std::to_string(expected_size) + " or " + std::to_string(expected_size_with_mtu) + "), dropping proof.");
-								VERBOSEF("[LRPROOF] DROP bad-size dst=%s%s data=%u expected=%u/%u", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), (unsigned)packet.data().size(), (unsigned)expected_size, (unsigned)expected_size_with_mtu);
 							}
 						}
 						catch (std::exception& e) {
@@ -3063,14 +2785,12 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 					else {
 						DEBUG("LRPROOF-XPORT: IFACE MISMATCH recv=" + packet.receiving_interface().toString() + " expected_out=" + link_entry._outbound_interface.toString());
 						DEBUG("LRPROOF-XPORT: Proof received on wrong interface, not transporting.");
-						VERBOSEF("[LRPROOF] DROP iface-mismatch dst=%s%s recv=%s expected=%s", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), packet.receiving_interface().toString().c_str(), link_entry._outbound_interface.toString().c_str());
 					}
 				}
 				else {
 					// Not in link_table or transport not enabled — check
 					// if we can deliver it to a local pending link
 					DEBUG("LRPROOF-XPORT: not in link_table or transport not enabled, checking local pending links (transport=" + std::to_string(Reticulum::transport_enabled()) + " for_lcl=" + std::to_string(for_local_client_link) + " from_lcl=" + std::to_string(from_local_client) + " in_lt=" + std::to_string(_link_table.find(packet.destination_hash()) != _link_table.end()) + ")");
-					VERBOSEF("[LRPROOF] LOCAL-CHECK dst=%s%s pending=%u", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), (unsigned)_pending_links.size());
 					// CBA Must make a copy of _pending_links before traversing since it gets modified
 					//for (auto link : _pending_links) {
 					std::set<Link> pending_links(_pending_links);
@@ -3109,18 +2829,14 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 				}
 
 				// Check if this proof needs to be transported
-				if ((Reticulum::transport_enabled() || from_local_client || proof_for_local_client) && _reverse_table.find(packet.destination_hash()) != _reverse_table.end()) {
-					ReverseEntry reverse_entry = (*_reverse_table.find(packet.destination_hash())).second;
+				if ((Reticulum::transport_enabled() || from_local_client || proof_for_local_client) && flatmap_find(_reverse_table, packet.destination_hash()) != _reverse_table.end()) {
+					ReverseEntry reverse_entry = (*flatmap_find(_reverse_table, packet.destination_hash())).second;
 					if (packet.receiving_interface() == reverse_entry._outbound_interface) {
 						TRACE("Proof received on correct interface, transporting it via " + reverse_entry._receiving_interface.toString());
-						VERBOSEF("[PROOF] XPORT dst=%s%s data=%u hops=%u recv=%s out=%s",
-							packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), (unsigned)packet.data().size(),
-							(unsigned)packet.hops(), packet.receiving_interface().toString().c_str(),
-							reverse_entry._receiving_interface.toString().c_str());
 						//p new_raw = packet.raw[0:1]
 						// CBA RESERVE
 						//Bytes new_raw = packet.raw().left(1);
-						Bytes new_raw(packet.raw().size());
+						Bytes new_raw(512);
 						new_raw << packet.raw().left(1);
 						//p new_raw += struct.pack("!B", packet.hops)
 						new_raw << packet.hops();
@@ -3130,12 +2846,10 @@ static const char* boundary_whitelist_annotation(const Bytes& destination_hash) 
 					}
 					else {
 						DEBUG("Proof received on wrong interface, not transporting it.");
-						VERBOSEF("[PROOF] DROP iface-mismatch dst=%s%s recv=%s expected=%s", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), packet.receiving_interface().toString().c_str(), reverse_entry._outbound_interface.toString().c_str());
 					}
 				}
 				else {
 					TRACE("Proof is not candidate for transporting");
-					VERBOSEF("[PROOF] LOCAL dst=%s%s in_rev=%u from_lcl=%u proof_lcl=%u", packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), _reverse_table.find(packet.destination_hash()) != _reverse_table.end() ? 1 : 0, from_local_client ? 1 : 0, proof_for_local_client ? 1 : 0);
 				}
 
 				std::list<PacketReceipt> cull_receipts;
@@ -3499,63 +3213,24 @@ Deregisters an announce handler.
 // the packet cache.
 /*static*/ bool Transport::cache_packet(const Packet& packet, bool force_cache /*= false*/) {
 	TRACE("Checking to see if packet " + packet.get_hash().toHex() + " should be cached");
-	if (should_cache_packet(packet) || force_cache) {
-#ifdef FIREWALL_MODE
-		Bytes packet_hash = packet.get_hash();
-		_packet_table.erase(packet_hash);
-		_packet_table.insert({packet_hash, PacketEntry(packet)});
-		_known_cached_packet_hashes.insert(packet_hash);
-		while (_packet_table.size() > _path_table_maxsize) {
-			auto oldest = _packet_table.begin();
-			for (auto iter = _packet_table.begin(); iter != _packet_table.end(); ++iter) {
-				if ((*iter).second._sent_at < (*oldest).second._sent_at) {
-					oldest = iter;
-				}
-			}
-			_known_cached_packet_hashes.erase((*oldest).first);
-			_packet_table.erase(oldest);
-		}
-		return true;
-#else
 #if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
+	if (should_cache_packet(packet) || force_cache) {
 		TRACE("Saving packet " + packet.get_hash().toHex() + " to storage");
 		try {
 			char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
 			snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, packet.get_hash().toHex().c_str());
-			bool cached = (Persistence::serialize(packet, packet_cache_path) > 0);
-			if (cached) {
-				_known_cached_packet_hashes.insert(packet.get_hash());
-			}
-			return cached;
+			return (Persistence::serialize(packet, packet_cache_path) > 0);
 		}
 		catch (std::exception& e) {
 			ERROR("Error writing packet to cache. The contained exception was: " + std::string(e.what()));
 		}
-#endif
-#endif
 	}
+#endif
 	return false;
 }
 
 /*static*/ Packet Transport::get_cached_packet(const Bytes& packet_hash) {
 	TRACE("Loading packet " + packet_hash.toHex() + " from cache storage");
-#ifdef FIREWALL_MODE
-	auto packet_iter = _packet_table.find(packet_hash);
-	if (packet_iter == _packet_table.end()) {
-		_known_cached_packet_hashes.erase(packet_hash);
-		return {Type::NONE};
-	}
-	Packet packet(Destination({Type::NONE}), (*packet_iter).second._raw);
-	if (packet.unpack()) {
-		packet.receiving_interface((*packet_iter).second._receiving_interface);
-		packet.sent_at((*packet_iter).second._sent_at);
-		packet.cached(true);
-		return packet;
-	}
-	_packet_table.erase(packet_iter);
-	_known_cached_packet_hashes.erase(packet_hash);
-	return {Type::NONE};
-#else
 #if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
 	try {
 /*p
@@ -3578,17 +3253,8 @@ Deregisters an announce handler.
 		else:
 			return None
 */
-#ifdef FIREWALL_MODE
-		if (_known_cached_packet_hashes.find(packet_hash) == _known_cached_packet_hashes.end()) {
-			return {Type::NONE};
-		}
-#endif
 		char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
 		snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, packet_hash.toHex().c_str());
-		if (!OS::file_exists(packet_cache_path)) {
-			_known_cached_packet_hashes.erase(packet_hash);
-			return {Type::NONE};
-		}
 		Packet packet({Type::NONE});
 		if (Persistence::deserialize(packet, packet_cache_path) > 0) {
 			packet.unpack();
@@ -3601,25 +3267,16 @@ Deregisters an announce handler.
 	}
 #endif
 	return {Type::NONE};
-#endif
 }
 
 /*static*/ bool Transport::clear_cached_packet(const Bytes& packet_hash) {
 	TRACE("Clearing packet " + packet_hash.toHex() + " from cache storage");
-#ifdef FIREWALL_MODE
-	_packet_table.erase(packet_hash);
-	_known_cached_packet_hashes.erase(packet_hash);
-	return true;
-#else
 #if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
 	try {
 		char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
 		snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, packet_hash.toHex().c_str());
 		double start_time = OS::time();
 		bool success = RNS::Utilities::OS::remove_file(packet_cache_path);
-		if (success) {
-			_known_cached_packet_hashes.erase(packet_hash);
-		}
 		double diff_time = OS::time() - start_time;
 		if (diff_time < 1.0) {
 			DEBUG("Remove cached packet in " + std::to_string((int)(diff_time*1000)) + " ms");
@@ -3634,7 +3291,6 @@ Deregisters an announce handler.
 	}
 #endif
 	return false;
-#endif
 }
 
 /*static*/ bool Transport::cache_request_packet(const Packet& packet) {
@@ -3673,6 +3329,28 @@ Deregisters an announce handler.
 	}
 }
 
+/*static*/ const Transport::PathEntry* Transport::select_path(const Bytes& destination_hash) {
+	auto iter = _destination_table.find(destination_hash);
+	if (iter == _destination_table.end()) return nullptr;
+
+	const auto& deque = iter->second;
+	double now = OS::time();
+	const PathEntry* best = nullptr;
+	double best_score = -1.0;
+
+	for (const auto& entry : deque) {
+		if (entry.is_expired(now)) continue;
+		Interface iface = find_interface_from_hash(entry.receiving_interface);
+		uint32_t bitrate = iface ? iface.bitrate() : 0;
+		double s = entry.score(bitrate);
+		if (s > best_score) {
+			best_score = s;
+			best = &entry;
+		}
+	}
+	return best;
+}
+
 /*static*/ bool Transport::remove_path(const Bytes& destination_hash) {
 	if (_destination_table.erase(destination_hash) > 0) {
 		// CBA also remove cached announce packet if exists
@@ -3685,12 +3363,7 @@ Deregisters an announce handler.
 :returns: *True* if a path to the destination is known, otherwise *False*.
 */
 /*static*/ bool Transport::has_path(const Bytes& destination_hash) {
-	if (_destination_table.find(destination_hash) != _destination_table.end()) {
-		return true;
-	}
-	else {
-		return false;
-	}
+	return select_path(destination_hash) != nullptr;
 }
 
 /*
@@ -3698,10 +3371,9 @@ Deregisters an announce handler.
 :returns: The number of hops to the specified destination, or ``RNS.Transport.PATHFINDER_M`` if the number of hops is unknown.
 */
 /*static*/ uint8_t Transport::hops_to(const Bytes& destination_hash) {
-	auto iter = _destination_table.find(destination_hash);
-	if (iter != _destination_table.end()) {
-		DestinationEntry destination_entry = (*iter).second;
-		return destination_entry._hops;
+	const PathEntry* entry = select_path(destination_hash);
+	if (entry) {
+		return entry->hops;
 	}
 	else {
 		return PATHFINDER_M;
@@ -3713,10 +3385,9 @@ Deregisters an announce handler.
 :returns: The destination hash as *bytes* for the next hop to the specified destination, or *None* if the next hop is unknown.
 */
 /*static*/ Bytes Transport::next_hop(const Bytes& destination_hash) {
-	auto iter = _destination_table.find(destination_hash);
-	if (iter != _destination_table.end()) {
-		DestinationEntry destination_entry = (*iter).second;
-		return destination_entry._received_from;
+	const PathEntry* entry = select_path(destination_hash);
+	if (entry) {
+		return entry->next_hop;
 	}
 	else {
 		return {};
@@ -3728,10 +3399,9 @@ Deregisters an announce handler.
 :returns: The interface for the next hop to the specified destination, or *None* if the interface is unknown.
 */
 /*static*/ Interface Transport::next_hop_interface(const Bytes& destination_hash) {
-	auto iter = _destination_table.find(destination_hash);
-	if (iter != _destination_table.end()) {
-		DestinationEntry destination_entry = (*iter).second;
-		return destination_entry.receiving_interface();
+	const PathEntry* entry = select_path(destination_hash);
+	if (entry) {
+		return find_interface_from_hash(entry->receiving_interface);
 	}
 	else {
 		return {Type::NONE};
@@ -3799,16 +3469,33 @@ Deregisters an announce handler.
 }
 
 /*static*/ bool Transport::expire_path(const Bytes& destination_hash) {
+	// Remove ALL entries for this destination (hard delete, not soft-expire)
+	return _destination_table.erase(destination_hash) > 0;
+}
+
+/*static*/ bool Transport::mark_path_unresponsive(const Bytes& destination_hash, const Bytes& blocked_interface /*= {}*/) {
 	auto iter = _destination_table.find(destination_hash);
-	if (iter != _destination_table.end()) {
-		DestinationEntry destination_entry = (*iter).second;
-		destination_entry._timestamp = 0;
-		_tables_last_culled = 0;
+	if (iter == _destination_table.end()) return false;
+
+	auto& deque = iter->second;
+	if (!blocked_interface) {
+		// No interface specified: remove all paths (backward compat)
+		_destination_table.erase(iter);
 		return true;
 	}
-	else {
-		return false;
+
+	// Remove only entries matching the blocked interface
+	size_t before = deque.size();
+	deque.erase(std::remove_if(deque.begin(), deque.end(),
+		[&blocked_interface](const PathEntry& e) {
+			return e.receiving_interface == blocked_interface;
+		}), deque.end());
+
+	// If deque is now empty, remove the whole destination entry
+	if (deque.empty()) {
+		_destination_table.erase(iter);
 	}
+	return deque.size() < before;
 }
 
 /*p
@@ -3913,7 +3600,7 @@ will announce it.
 	}
 
 	packet.send();
-	_path_requests[destination_hash] = OS::time();
+	flatmap_upsert(_path_requests, destination_hash, OS::time());
 }
 
 /*static*/ void Transport::request_path(const Bytes& destination_hash) {
@@ -3923,11 +3610,6 @@ will announce it.
 /*static*/ void Transport::path_request_handler(const Bytes& data, const Packet& packet) {
 	TRACE("Transport::path_request_handler");
 	if (data.size() >= 16) { DEBUG("DIAG: PATH-REQ for " + data.left(16).toHex().substr(0,8) + " from " + packet.receiving_interface().toString()); }
-	if (data.size() >= 16) {
-		VERBOSEF("[PATH] REQ dst=%s%s from=%s local=%u sz=%u",
-			data.left(16).toHex().substr(0,8).c_str(), packet_whitelist_annotation(packet), packet.receiving_interface().toString().c_str(),
-			from_local_client(packet) ? 1 : 0, (unsigned)data.size());
-	}
 	try {
 		// If there is at least bytes enough for a destination
 		// hash in the packet, we assume those bytes are the
@@ -3994,11 +3676,7 @@ will announce it.
 	std::string interface_str;
 
 	if (attached_interface) {
-		bool attached_can_discover = true;
-#ifdef FIREWALL_MODE
-		attached_can_discover = is_boundary_trusted_interface(attached_interface);
-#endif
-		if (Reticulum::transport_enabled() && attached_can_discover && (attached_interface.mode() & Interface::DISCOVER_PATHS_FOR) > 0) {
+		if (Reticulum::transport_enabled() && (attached_interface.mode() & Interface::DISCOVER_PATHS_FOR) > 0) {
 			TRACE("Transport::path_request_handler: interface allows searching for unknown paths");
 			should_search_for_unknown = true;
 		}
@@ -4010,14 +3688,13 @@ will announce it.
 
 	bool destination_exists_on_local_client = false;
 	if (_local_client_interfaces.size() > 0) {
-		auto iter = _destination_table.find(destination_hash);
-		if (iter != _destination_table.end()) {
+		if (has_path(destination_hash)) {
 			TRACE("Transport::path_request_handler: entry found for destination " + destination_hash.toHex());
-			DestinationEntry& destination_entry = (*iter).second;
-			if (is_local_client_interface(destination_entry.receiving_interface())) {
+			Interface iface = next_hop_interface(destination_hash);
+			if (is_local_client_interface(iface)) {
 				destination_exists_on_local_client = true;
 				// CBA ACCUMULATES
-				_pending_local_path_requests[destination_hash] = attached_interface ? attached_interface.get_hash() : Bytes();
+				_pending_local_path_requests.insert({destination_hash, attached_interface.get_hash()});
 			}
 		}
 		else {
@@ -4046,24 +3723,35 @@ will announce it.
 		DEBUG("Answering path request for destination " + destination_hash.toHex() + interface_str + ", destination is local to this system");
 	}
     //p elif (RNS.Reticulum.transport_enabled() or is_from_local_client) and (destination_hash in Transport.destination_table):
-	else if ((Reticulum::transport_enabled() || is_from_local_client) && destination_iter != _destination_table.end()) {
+	else if ((Reticulum::transport_enabled() || is_from_local_client) && has_path(destination_hash)) {
 		TRACE("Transport::path_request_handler: entry found for destination " + destination_hash.toHex());
-		DestinationEntry& destination_entry = (*destination_iter).second;
-		const Packet& announce_packet = destination_entry.announce_packet();
-		const Bytes& next_hop = destination_entry._received_from;
+		const PathEntry* entry = select_path(destination_hash);
+		if (!entry) {
+			TRACE("path_request: selected path expired for " + destination_hash.toHex());
+			return;
+		}
+		const Packet& announce_packet = get_cached_packet(entry->packet_hash);
+		const Bytes& next_hop = entry->next_hop;
 		if (!announce_packet) {
 			// Cache file missing or corrupt — remove the stale entry and bail
 			WARNING("path_request: removing stale path to " + destination_hash.toHex() + " due to missing announce packet cache");
-			_destination_table.erase(destination_iter);
+			// Remove the specific entry with the missing cache
+			auto iter = _destination_table.find(destination_hash);
+			if (iter != _destination_table.end()) {
+				iter->second.erase(std::remove_if(iter->second.begin(), iter->second.end(),
+					[&entry](const PathEntry& e) { return e.packet_hash == entry->packet_hash; }),
+					iter->second.end());
+				if (iter->second.empty()) _destination_table.erase(iter);
+			}
 			return;
 		}
-		const Interface& receiving_interface = destination_entry.receiving_interface();
+		const Interface& receiving_interface = find_interface_from_hash(entry->receiving_interface);
 
 		if (attached_interface.mode() == Type::Interface::MODE_ROAMING && attached_interface == receiving_interface) {
 			DEBUG("Not answering path request on roaming-mode interface, since next hop is on same roaming-mode interface");
 		}
 		else {
-			if (requestor_transport_id && destination_entry._received_from == requestor_transport_id) {
+			if (requestor_transport_id && entry->next_hop == requestor_transport_id) {
 				// TODO: Find a bandwidth efficient way to invalidate our
 				// known path on this signal. The obvious way of signing
 				// path requests with transport instance keys is quite
@@ -4080,15 +3768,8 @@ will announce it.
 				uint8_t retries = Type::Transport::PATHFINDER_R;
 				uint8_t local_rebroadcasts = 0;
 				bool block_rebroadcasts = true;
-				// BUG FIX: Must use DestinationEntry._hops, NOT cached announce_packet.hops().
-				// The cached packet's raw bytes still have the pre-increment wire hops,
-				// because Packet::hops(val) only updates an in-memory field, not raw[1].
-				// Python Transport.py explicitly sets packet.hops = path_table[dest][IDX_PT_HOPS]
-				// after retrieving the cached packet (line 2736), but C++ was using the
-				// stale raw-byte value. This caused PATH_RESPONSE to report fewer hops than
-				// actual, making the sender's expected_hops too low, which then caused
-				// LRPROOF hop-count validation to fail silently.
-				uint8_t announce_hops = destination_entry._hops;
+				// Use PathEntry.hops (correct hop count from announce, not stale wire bytes)
+				uint8_t announce_hops = entry->hops;
 
 				double retransmit_timeout = 0;
 				if (is_from_local_client) {
@@ -4120,149 +3801,53 @@ will announce it.
 					now,
 					retransmit_timeout,
 					retries,
-					destination_entry._received_from,
+					next_hop,
 					announce_hops,
 					announce_packet,
 					local_rebroadcasts,
 					block_rebroadcasts,
 					attached_interface
 				);
-				// ESP32/FIREWALL_MODE FIX: For requests from LAN-side interfaces,
-				// send the PATH_RESPONSE immediately rather than waiting for the
-				// jobs() loop to process the announce_table entry. This includes
-				// Local TCP clients and LoRa. Backbone/WAN interfaces remain
-				// suppressed below to preserve the boundary firewall.
-				bool send_immediate_path_response = is_from_local_client;
-#ifdef FIREWALL_MODE
-				if (attached_interface) {
-					if (!is_backbone_interface(attached_interface)) {
-						send_immediate_path_response = true;
-					}
-					else if (destination_exists_on_local_client) {
-						// A backbone requester is asking for a destination we already
-						// know is behind a trusted local client, so this reply is a
-						// solicited PATH_RESPONSE, not unsolicited WAN ingress.
-						send_immediate_path_response = true;
-					}
-				}
-#endif
-				if (send_immediate_path_response) {
-					Identity imm_identity(Identity::recall(announce_packet.destination_hash()));
-					Destination imm_destination(imm_identity, Type::Destination::OUT, Type::Destination::SINGLE, announce_packet.destination_hash());
-					Packet imm_packet(
-						imm_destination,
-						attached_interface,
-						announce_packet.data(),
-						Type::Packet::ANNOUNCE,
-						Type::Packet::PATH_RESPONSE,
-						Type::Transport::TRANSPORT,
-						Type::Packet::HEADER_2,
-						_identity.hash(),
-						true,
-						announce_packet.context_flag()
-					);
-					imm_packet.hops(announce_hops);
-					imm_packet.send();
-					VERBOSEF("[PATH] RESP dst=%s%s hops=%u to=%s local=%u",
-						announce_packet.destination_hash().toHex().substr(0,8).c_str(), packet_whitelist_annotation(announce_packet),
-						(unsigned)announce_hops, attached_interface.toString().c_str(),
-						is_from_local_client ? 1 : 0);
-					DEBUG("DIAG: PATH-RESP immediate send for " + announce_packet.destination_hash().toHex().substr(0,8) + " hops=" + std::to_string(announce_hops) + " to " + attached_interface.toString());
-
-					// Remove from announce_table since we already sent it
-					_announce_table.erase(announce_packet.destination_hash());
-				}
-#ifdef FIREWALL_MODE
-				if (attached_interface && is_boundary_trusted_interface(attached_interface)) {
-					// Keep a queued local retry even after an immediate send. On
-					// repeated LAN-to-WAN requests the immediate response can arrive
-					// before the fresh local client has fully entered path discovery,
-					// but a scheduled retry one job tick later is accepted.
-					announce_entry._retransmit_timeout = OS::time() + _announces_check_interval;
-					_announce_table.erase(announce_packet.destination_hash());
-					_announce_table.insert({announce_packet.destination_hash(), announce_entry});
-				}
-				else {
-					DEBUG("BOUNDARY: Suppressing queued path-response announce for " + announce_packet.destination_hash().toHex().substr(0,8));
-				}
-#else
 				// CBA ACCUMULATES
 				_announce_table.insert({announce_packet.destination_hash(), announce_entry});
-#endif
+
+				// ESP32 FIX: For requests from local clients, send the
+				// PATH_RESPONSE immediately rather than waiting for the
+				// jobs() loop to process the announce_table entry. On the
+				// ESP32, continuous TCP backbone data can starve the jobs
+				// loop for many seconds, causing path discovery timeouts.
+				if (is_from_local_client) {
+					Identity imm_identity(Identity::recall(announce_packet.destination_hash()));
+					if (imm_identity) {
+						Destination imm_destination(imm_identity, Type::Destination::OUT, Type::Destination::SINGLE, announce_packet.destination_hash());
+						Packet imm_packet(
+							imm_destination,
+							attached_interface,
+							announce_packet.data(),
+							Type::Packet::ANNOUNCE,
+							Type::Packet::PATH_RESPONSE,
+							Type::Transport::TRANSPORT,
+							Type::Packet::HEADER_2,
+							_identity.hash(),
+							true,
+							announce_packet.context_flag()
+						);
+						imm_packet.hops(announce_hops);
+						imm_packet.send();
+						DEBUG("DIAG: PATH-RESP immediate send for " + announce_packet.destination_hash().toHex().substr(0,8) + " hops=" + std::to_string(announce_hops) + " to " + attached_interface.toString());
+
+						// Remove from announce_table since we already sent it
+						_announce_table.erase(announce_packet.destination_hash());
+					}
+				}
 			}
 		}
 	}
 	else if (is_from_local_client) {
-		#ifdef FIREWALL_MODE
-		auto held_iter = _held_announces.find(destination_hash);
-		if (held_iter != _held_announces.end()) {
-			AnnounceEntry held_entry = (*held_iter).second;
-			Packet held_packet = held_entry._packet;
-			if (held_packet) {
-				DEBUG("BOUNDARY: Promoting buffered backbone announce for " + destination_hash.toHex().substr(0,8) + " into path table");
-				if (RNS::Transport::cache_packet(held_packet, true)) {
-					held_packet.cached(true);
-				}
-
-				double now = OS::time();
-				double expires;
-				if (held_packet.receiving_interface().mode() == Type::Interface::MODE_ACCESS_POINT) {
-					expires = now + AP_PATH_TIME;
-				}
-				else if (held_packet.receiving_interface().mode() == Type::Interface::MODE_ROAMING) {
-					expires = now + ROAMING_PATH_TIME;
-				}
-				else {
-					expires = now + PATHFINDER_E;
-				}
-
-				std::set<Bytes> random_blobs;
-				random_blobs.insert(held_packet.data().mid(Type::Identity::KEYSIZE/8 + Type::Identity::NAME_HASH_LENGTH/8, Type::Identity::RANDOM_HASH_LENGTH/8));
-
-				DestinationEntry destination_table_entry(
-					now,
-					held_entry._received_from,
-					held_entry._hops,
-					expires,
-					random_blobs,
-					held_packet.receiving_interface().get_hash(),
-					held_packet.get_hash()
-				);
-
-				bool path_existed = (_destination_table.erase(destination_hash) > 0);
-				if (_destination_table.insert({destination_hash, destination_table_entry}).second) {
-					if (!path_existed) {
-						++_destinations_added;
-						cull_path_table();
-					}
-				}
-
-				VERBOSEF("[PATH] PROMOTE dst=%s%s hops=%u iface=%s paths=%u",
-					destination_hash.toHex().substr(0,8).c_str(), boundary_whitelist_annotation(destination_hash), (unsigned)held_entry._hops,
-					held_packet.receiving_interface().toString().c_str(), (unsigned)_destination_table.size());
-				_held_announces.erase(held_iter);
-				path_request(destination_hash, is_from_local_client, attached_interface, requestor_transport_id, tag);
-				return;
-			}
-
-			WARNING("BOUNDARY: Dropping buffered backbone announce for " + destination_hash.toHex().substr(0,8) + " because the packet payload is unavailable");
-			_held_announces.erase(held_iter);
-		}
-		#endif
-
 		// Forward path request on all interfaces
 		// except the local client
 		DEBUG("Forwarding path request from local client for destination " + destination_hash.toHex() + interface_str + " to all other interfaces");
 		Bytes request_tag = Identity::get_random_hash();
-#if defined(FIREWALL_MODE)
-		_discovery_path_requests.erase(destination_hash);
-		_discovery_path_requests.insert({destination_hash, {
-			destination_hash,
-			OS::time() + Type::Transport::PATH_REQUEST_TIMEOUT,
-			attached_interface
-		}});
-		_boundary_mentioned_addresses.insert(destination_hash);
-#endif
 #if defined(INTERFACES_SET)
 		for (const Interface& interface : _interfaces) {
 #elif defined(INTERFACES_LIST)
@@ -4277,7 +3862,7 @@ will announce it.
 	}
 	else if (should_search_for_unknown) {
 		TRACE("Transport::path_request_handler: searching for unknown path to " + destination_hash.toHex());
-		if (_discovery_path_requests.find(destination_hash) != _discovery_path_requests.end()) {
+		if (flatmap_find(_discovery_path_requests, destination_hash) != _discovery_path_requests.end()) {
 			DEBUG("There is already a waiting path request for destination " + destination_hash.toHex() + " on behalf of path request" + interface_str);
 		}
 		else {
@@ -4285,18 +3870,18 @@ will announce it.
 			// except the requestor interface
 			DEBUG("Attempting to discover unknown path to destination " + destination_hash.toHex() + " on behalf of path request" + interface_str);
 			//p pr_entry = { "destination_hash": destination_hash, "timeout": time.time()+Transport.PATH_REQUEST_TIMEOUT, "requesting_interface": attached_interface }
-			//p _discovery_path_requests[destination_hash] = pr_entry;
+			//p _discoveryflatmap_upsert(_path_requests, destination_hash,  = pr_entry;
 			// CBA ACCUMULATES
-			_discovery_path_requests.insert({destination_hash, {
+			_discovery_path_requests.push_back({destination_hash, {
 				destination_hash,
 				OS::time() + Type::Transport::PATH_REQUEST_TIMEOUT,
 				attached_interface
 			}});
 
-#if defined(FIREWALL_MODE)
+#if defined(BOUNDARY_MODE)
 			// BOUNDARY: Track this destination in Whitelist 2 so the path
 			// response announce from the backbone will be allowed through
-			_boundary_mentioned_addresses.insert(destination_hash);
+			_boundary_mentioned_addresses.push_back(destination_hash);
 #endif
 
 #if defined(INTERFACES_SET)
@@ -4322,42 +3907,22 @@ will announce it.
 		}
 	}
 	else if (!is_from_local_client && _local_client_interfaces.size() > 0) {
-		// Forward path requests to local clients so LAN destinations can
-		// satisfy direct discovery from either side of the boundary.
-		Bytes request_tag = tag ? tag : Identity::get_random_hash();
 #ifdef FIREWALL_MODE
-		if (attached_interface && is_boundary_untrusted_interface(attached_interface)
-			&& !boundary_hash_in_local_whitelist(destination_hash)) {
-			DEBUG("BOUNDARY: Ignoring unknown path request for destination " + destination_hash.toHex() + interface_str + " from untrusted interface, destination is not a trusted local address");
+		// Only forward backbone path requests for destinations our local
+		// devices care about.  Without this check, every path request
+		// from the backbone for every unknown destination floods into
+		// _path_requests (one entry per local client per request).
+		if (std::find(_boundary_local_addresses.begin(), _boundary_local_addresses.end(), destination_hash) == _boundary_local_addresses.end() &&
+			std::find(_boundary_mentioned_addresses.begin(), _boundary_mentioned_addresses.end(), destination_hash) == _boundary_mentioned_addresses.end()) {
+			DEBUG("Ignoring path request for non-whitelisted destination " + destination_hash.toHex() + interface_str + " from backbone");
 			return;
 		}
 #endif
-		if (_discovery_path_requests.find(destination_hash) != _discovery_path_requests.end()) {
-			DEBUG("There is already a waiting local-client discovery path request for destination " + destination_hash.toHex() + interface_str);
-			return;
-		}
-
-		_discovery_path_requests.erase(destination_hash);
-		_discovery_path_requests.insert({destination_hash, {
-			destination_hash,
-			OS::time() + Type::Transport::PATH_REQUEST_TIMEOUT,
-			attached_interface
-		}});
-
-#ifdef FIREWALL_MODE
-		if (attached_interface && is_boundary_untrusted_interface(attached_interface)) {
-			DEBUG("BOUNDARY: Forwarding unknown path request for destination " + destination_hash.toHex() + interface_str + " from untrusted interface to local clients");
-		}
-		else {
-			DEBUG("Forwarding path request for destination " + destination_hash.toHex() + interface_str + " to local clients");
-		}
-		// Only LAN-originated mentions expand the whitelist. WAN path-request
-		// noise must not be retained as trusted destinations.
-#else
+		// Forward the path request on all local
+		// client interfaces
 		DEBUG("Forwarding path request for destination " + destination_hash.toHex() + interface_str + " to local clients");
-#endif
 		for (const Interface& interface : _local_client_interfaces) {
-			request_path(destination_hash, interface, request_tag, true);
+			request_path(destination_hash, interface);
 		}
 	}
 	else {
@@ -4366,14 +3931,15 @@ will announce it.
 }
 
 /*static*/ bool Transport::from_local_client(const Packet& packet) {
-	return is_local_client_interface(packet.receiving_interface());
+	if (packet.receiving_interface().parent_interface()) {
+		return is_local_client_interface(packet.receiving_interface());
+	}
+	else {
+		return false;
+	}
 }
 
 /*static*/ bool Transport::is_local_client_interface(const Interface& interface) {
-	if (_local_client_interfaces.find(interface) != _local_client_interfaces.end()) {
-		return true;
-	}
-
 	if (interface.parent_interface()) {
 		if (interface.parent_interface()->is_local_shared_instance()) {
 			return true;
@@ -4589,7 +4155,7 @@ TRACEF("Transport::start: buffer size %d bytes", Persistence::_buffer.size());
 				if (!error) {
 					// Calculate crc for dirty-checking before write
 					_destination_table_crc = Crc::crc32(0, Persistence::_buffer.data(), Persistence::_buffer.size());
-					_destination_table = Persistence::_document.as<std::map<Bytes, DestinationEntry>>();
+					_destination_table = Persistence::_document.as<std::map<Bytes, std::deque<PathEntry>>>();
 #else	// CUSTOM
 				// Calculate crc for dirty-checking before write
 				if (Persistence::deserialize(_destination_table, destination_table_path, _destination_table_crc) > 0) {
@@ -4597,20 +4163,18 @@ TRACEF("Transport::start: buffer size %d bytes", Persistence::_buffer.size());
 
 					TRACEF("Transport::start: successfully deserialized path table with %d entries", _destination_table.size());
 					std::vector<Bytes> invalid_paths;
-					for (auto& [destination_hash, destination_entry] : _destination_table) {
-#ifndef NDEBUG
-						TRACEF("Transport::start: entry: %s = %s", destination_hash.toHex().c_str(), destination_entry.debugString().c_str());
-#endif
-						// CBA If announce packet load fails then remove destination entry (it's useless without announce packet)
-						if (!destination_entry.announce_packet()) {
-							// remove destination
-							WARNINGF("Transport::start: removing invalid path to %s due to missing announce packet", destination_hash.toHex().c_str());
-							invalid_paths.push_back(destination_hash);
-						}
-						// CBA If receiving interface is not found then remove destination entry (it's useless without interface)
-						if (!destination_entry.receiving_interface()) {
-							// remove destination
-							WARNINGF("Transport::start: removing invalid path to %s due to missing receiving interface", destination_hash.toHex().c_str());
+					for (auto& [destination_hash, deque] : _destination_table) {
+						// Remove individual entries with missing packet cache or interface
+						deque.erase(std::remove_if(deque.begin(), deque.end(),
+							[](PathEntry& entry) {
+								Interface iface = find_interface_from_hash(entry.receiving_interface);
+								Packet pkt = get_cached_packet(entry.packet_hash);
+								if (!iface || !pkt) {
+									return true; // remove
+								}
+								return false;
+							}), deque.end());
+						if (deque.empty()) {
 							invalid_paths.push_back(destination_hash);
 						}
 					}
@@ -4618,19 +4182,19 @@ TRACEF("Transport::start: buffer size %d bytes", Persistence::_buffer.size());
 						_destination_table.erase(destination_hash);
 					}
 
-					// Enforce maxsize on loaded paths (trim oldest if over limit)
+					// Enforce maxsize on loaded paths (trim lowest-score if over limit)
 					if (_destination_table.size() > _path_table_maxsize) {
 						DEBUGF("Transport::start: trimming loaded path table from %d to %d entries", _destination_table.size(), _path_table_maxsize);
 						cull_path_table();
 					}
 
 					// Memory diagnostic after path table load
-					size_t total_blobs = 0;
-					for (const auto& [hash, entry] : _destination_table) {
-						total_blobs += entry._random_blobs.size();
+					size_t total_entries = 0;
+					for (const auto& [hash, deque] : _destination_table) {
+						total_entries += deque.size();
 					}
-					DEBUGF("Transport::start: path table: %d entries, %d total random_blobs (est. %d bytes)",
-						_destination_table.size(), total_blobs, total_blobs * 90);
+					DEBUGF("Transport::start: path table: %d dests, %d total entries",
+						_destination_table.size(), total_entries);
 
 					return true;
 				}
@@ -4684,21 +4248,35 @@ TRACEF("Transport::start: buffer size %d bytes", Persistence::_buffer.size());
 		DEBUGF("Saving %d path table entries to storage...", _destination_table.size());
 
 		// Enforce maxpersist: create a trimmed copy for serialization
-		// keeping only the most recently used entries (by timestamp)
-		std::map<Bytes, DestinationEntry> persist_table;
+		// keeping only the destinations with the best-score paths
+		std::map<Bytes, std::deque<PathEntry>> persist_table;
 		if (_destination_table.size() <= _path_table_maxpersist) {
 			persist_table = _destination_table;
 		}
 		else {
-			// Sort by timestamp descending, keep only maxpersist entries
-			std::vector<std::pair<Bytes, DestinationEntry>> sorted_entries(_destination_table.begin(), _destination_table.end());
-			std::sort(sorted_entries.begin(), sorted_entries.end(), [](const std::pair<Bytes, DestinationEntry>& a, const std::pair<Bytes, DestinationEntry>& b) {
-				return a.second._timestamp > b.second._timestamp;
-			});
-			for (size_t i = 0; i < _path_table_maxpersist && i < sorted_entries.size(); i++) {
-				persist_table.insert(sorted_entries[i]);
+			// Sort destinations by best path score, keep top N
+			double now = OS::time();
+			std::vector<std::pair<Bytes, double>> scored;
+			for (auto& [dest_hash, deque] : _destination_table) {
+				double best_score = -1.0;
+				for (const auto& entry : deque) {
+					if (entry.is_expired(now)) continue;
+					Interface iface = find_interface_from_hash(entry.receiving_interface);
+					double s = entry.score(iface ? iface.bitrate() : 0);
+					if (s > best_score) best_score = s;
+				}
+				if (best_score < 0) best_score = 0;
+				scored.push_back({dest_hash, best_score});
 			}
-			DEBUGF("Trimmed path table from %d to %d entries for persistence", _destination_table.size(), persist_table.size());
+			std::sort(scored.begin(), scored.end(),
+				[](const std::pair<Bytes, double>& a, const std::pair<Bytes, double>& b) { return a.second > b.second; });
+			for (size_t i = 0; i < _path_table_maxpersist && i < scored.size(); i++) {
+				auto iter = _destination_table.find(scored[i].first);
+				if (iter != _destination_table.end()) {
+					persist_table.insert(*iter);
+				}
+			}
+			DEBUGF("Trimmed path table from %d to %d destinations for persistence", _destination_table.size(), persist_table.size());
 		}
 
 /*p
@@ -4988,11 +4566,14 @@ TRACE("Transport::write_path_table: buffer size " + std::to_string(Persistence::
     for (auto& file : files) {
 		TRACE("Transport::clean_caches: Checking for use of cached packet " + file);
 		bool found = false;
-		for (auto& [destination_hash, destination_entry] : _destination_table) {
-			if (file.compare(destination_entry._announce_packet.toHex()) == 0) {
-				found = true;
-				break;
+		for (auto& [destination_hash, deque] : _destination_table) {
+			for (auto& entry : deque) {
+				if (file.compare(entry.packet_hash.toHex()) == 0) {
+					found = true;
+					break;
+				}
 			}
+			if (found) break;
 		}
 		if (!found) {
 			TRACE("Transport::clean_caches: No matching path found, removing cached packet " + file);
@@ -5002,6 +4583,40 @@ TRACE("Transport::write_path_table: buffer size " + std::to_string(Persistence::
 		}
 	}
 #endif
+}
+
+/*static*/ void Transport::clear_caches_in_memory() {
+	TRACE("Transport::clear_caches_in_memory()");
+
+	// Clear the packet hashlist (duplicate detection, ~100 × 40 bytes = ~4KB)
+	if (!_packet_hashlist.empty()) {
+		size_t before = _packet_hashlist.size();
+		_packet_hashlist.clear();
+		DEBUGF("Transport::clear_caches_in_memory: cleared %d packet hashlist entries", before);
+	}
+
+	// Clear global anti-replay blobs (capped at 8 × ~80 bytes = ~640 bytes)
+	if (!_global_blobs.empty()) {
+		size_t before = _global_blobs.size();
+		_global_blobs.clear();
+		DEBUGF("Transport::clear_caches_in_memory: cleared %d global blobs", before);
+	}
+
+	// Clear announce rate table
+	if (!_announce_rate_table.empty()) {
+		size_t before = _announce_rate_table.size();
+		_announce_rate_table.clear();
+		DEBUGF("Transport::clear_caches_in_memory: cleared %d announce rate entries", before);
+	}
+
+	// Clear discovery path request tags
+	if (!_discovery_pr_tags.empty()) {
+		size_t before = _discovery_pr_tags.size();
+		_discovery_pr_tags.clear();
+		DEBUGF("Transport::clear_caches_in_memory: cleared %d discovery PR tags", before);
+	}
+
+	cull_path_table();
 }
 
 /*static*/ void Transport::dump_stats() {
@@ -5025,7 +4640,7 @@ TRACE("Transport::write_path_table: buffer size " + std::to_string(Persistence::
 	// _reverse_table
 	// _announce_table
 	// _held_announces
-	HEADF(LOG_VERBOSE, "mem_free: %u (%u%%) [%d] flash_free: %u (%u%%) [%d] paths: %u dsts: %u revr: %u annc: %u held: %u", memory, (int)((double)memory / (double)OS::heap_size() * 100.0), memory - _last_memory, flash, (int)((double)flash / (double)OS::storage_size() * 100.0), flash - _last_flash, _destination_table.size(), _destinations.size(), _reverse_table.size(), _announce_table.size(), _held_announces.size());
+	HEADF(LOG_VERBOSE, "mem: %u (%u%%) [%d] flash: %u (%u%%) [%d] paths: %u dsts: %u revr: %u annc: %u held: %u", memory, (int)((double)memory / (double)OS::heap_size() * 100.0), memory - _last_memory, flash, (int)((double)flash / (double)OS::storage_size() * 100.0), flash - _last_flash, _destination_table.size(), _destinations.size(), _reverse_table.size(), _announce_table.size(), _held_announces.size());
 
 	// _path_requests
 	// _discovery_path_requests
@@ -5087,88 +4702,58 @@ TRACE("Transport::write_path_table: buffer size " + std::to_string(Persistence::
 
 /*static*/ void Transport::cull_path_table() {
 	TRACE("Transport::cull_path_table()");
+	double now = OS::time();
+
+	// Pass 1: Remove individual expired entries from each deque
+	std::vector<Bytes> empty_dests;
+	for (auto& [dest_hash, deque] : _destination_table) {
+		deque.erase(std::remove_if(deque.begin(), deque.end(),
+			[now](const PathEntry& e) { return e.is_expired(now); }),
+			deque.end());
+		if (deque.empty()) {
+			empty_dests.push_back(dest_hash);
+		}
+	}
+	// Remove empty destination entries
+	for (const auto& dest_hash : empty_dests) {
+		_destination_table.erase(dest_hash);
+	}
+
+	// Pass 2: If still over maxsize, evict destinations with the lowest-score best path
 	if (_destination_table.size() > _path_table_maxsize) {
-		// TODO prune by age, or better yet by last use
-/*
-		std::map<Bytes, DestinationEntry>::iterator iter = _destination_table.begin();
-		// naively erase from front of table
-		std::advance(iter, _destination_table.size() - _path_table_maxsize + 1);
-		_destination_table.erase(_destination_table.begin(), iter);
-*/
-/*
-		uint16_t count = 0;
-		std::set<DestinationEntry> sorted_values;
-		MapToValues(_destination_table, sorted_values);
-		for (auto& destination_entry : sorted_values) {
-			Packet announce_packet = destination_entry.announce_packet();
-			TRACE("Transport::cull_path_table: Removing destination " + announce_packet.destination_hash().toHex() + " from path table");
-			// Remove destination from path table
-			if (_destination_table.erase(announce_packet.destination_hash()) < 1) {
-				WARNING("Failed to remove destination " + announce_packet.destination_hash().toHex() + " from path table");
+		// Build sorted list: (dest_hash, best_score) ascending
+		std::vector<std::pair<Bytes, double>> scored;
+		for (auto& [dest_hash, deque] : _destination_table) {
+			double best_score = -1.0;
+			for (const auto& entry : deque) {
+				if (entry.is_expired(now)) continue;
+				Interface iface = find_interface_from_hash(entry.receiving_interface);
+				double s = entry.score(iface ? iface.bitrate() : 0);
+				if (s > best_score) best_score = s;
 			}
-			// Remove announce packet from packet table
-			//if (_packet_table.erase(destination_entry._announce_packet) < 1) {
-			//	WARNING("Failed to remove packet " + destination_entry._announce_packet.toHex() + " from packet table");
-			//}
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-			// Remove cached packet file
-			char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
-			snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, destination_entry._announce_packet.toHex().c_str());
-			if (OS::file_exists(packet_cache_path)) {
-				OS::remove_file(packet_cache_path);
-			}
-#endif
-			++count;
-			if (_destination_table.size() <= _path_table_maxsize) {
-				break;
-			}
+			if (best_score < 0) best_score = 0; // all expired, score 0
+			scored.push_back({dest_hash, best_score});
 		}
-		DEBUG("Removed " + std::to_string(count) + " path(s) from path table");
-*/
+		std::sort(scored.begin(), scored.end(),
+			[](const std::pair<Bytes, double>& a, const std::pair<Bytes, double>& b) { return a.second < b.second; });
+
 		uint16_t count = 0;
-		std::vector<std::pair<Bytes,DestinationEntry>> sorted_pairs;
-		// Copy key/value pairs from map into vector
-		std::for_each(_destination_table.begin(), _destination_table.end(), [&](const std::pair<const Bytes, DestinationEntry>& ref) {
-			sorted_pairs.push_back(ref);
-		});
-		// Sort vector using specified comparator
-		std::sort(sorted_pairs.begin(), sorted_pairs.end(), [](const std::pair<Bytes,DestinationEntry> &left, const std::pair<Bytes,DestinationEntry> &right) {
-			return left.second._timestamp < right.second._timestamp;
-		});
-		// Iterate vector of sorted values
-		for (auto& [destination_hash, destination_entry] : sorted_pairs) {
-			TRACE("Transport::cull_path_table: Removing destination " + destination_hash.toHex() + " from path table");
-			_packet_table.erase(destination_entry._announce_packet);
-			_known_cached_packet_hashes.erase(destination_entry._announce_packet);
-			// Remove destination from path table
-			if (_destination_table.erase(destination_hash) < 1) {
-				WARNING("Failed to remove destination " + destination_hash.toHex() + " from path table");
-			}
-			// Remove announce packet from packet table
-			//if (_packet_table.erase(destination_entry._announce_packet) < 1) {
-			//	WARNING("Failed to remove packet " + destination_entry._announce_packet.toHex() + " from packet table");
-			//}
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-			// Remove cached packet file
-			char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
-			snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, destination_entry._announce_packet.toHex().c_str());
-			if (OS::file_exists(packet_cache_path)) {
-				OS::remove_file(packet_cache_path);
-			}
-#endif
+		for (const auto& [dest_hash, score] : scored) {
+			if (_destination_table.size() <= _path_table_maxsize) break;
+			TRACE("Transport::cull_path_table: Removing destination " + dest_hash.toHex() + " from path table (score=" + std::to_string(score) + ")");
+			_destination_table.erase(dest_hash);
 			++count;
-			if (_destination_table.size() <= _path_table_maxsize) {
-				break;
-			}
 		}
-		DEBUG("Removed " + std::to_string(count) + " path(s) from path table");
+		if (count > 0) {
+			DEBUG("Removed " + std::to_string(count) + " path(s) from path table");
+		}
 	}
 }
 	
 /*static*/ uint16_t Transport::remove_reverse_entries(const std::vector<Bytes>& hashes) {
 	uint16_t count = 0;
 	for (const auto& truncated_packet_hash : hashes) {
-		_reverse_table.erase(truncated_packet_hash);
+		flatmap_erase(_reverse_table, truncated_packet_hash);
 		++count;
 	}
 	if (count > 0) {
@@ -5205,7 +4790,7 @@ TRACE("Transport::write_path_table: buffer size " + std::to_string(Persistence::
 /*static*/ uint16_t Transport::remove_discovery_path_requests(const std::vector<Bytes>& hashes) {
 	uint16_t count = 0;
 	for (const auto& destination_hash : hashes) {
-		_discovery_path_requests.erase(destination_hash);
+		flatmap_erase(_discovery_path_requests, destination_hash);
 		++count;
 	}
 	if (count > 0) {

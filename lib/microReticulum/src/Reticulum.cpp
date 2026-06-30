@@ -395,7 +395,7 @@ void Reticulum::get_interface_stats() const {
 }
 */
 
-const std::map<Bytes, Transport::DestinationEntry>& Reticulum::get_path_table() const {
+const std::map<Bytes, std::deque<Transport::PathEntry>>& Reticulum::get_path_table() const {
 /*
 	path_table = []
 	for dst_hash in Transport::destination_table:
@@ -414,7 +414,7 @@ const std::map<Bytes, Transport::DestinationEntry>& Reticulum::get_path_table() 
 	return Transport::get_destination_table();
 }
 
-const std::map<Bytes, Transport::RateEntry>& Reticulum::get_rate_table() const {
+const std::vector<std::pair<Bytes, Transport::RateEntry>>& Reticulum::get_rate_table() const {
 /*
 	rate_table = []
 	for dst_hash in Transport::announce_rate_table:
@@ -438,11 +438,13 @@ bool Reticulum::drop_path(const Bytes& destination) {
 
 uint16_t Reticulum::drop_all_via(const Bytes& transport_hash) {
 	uint16_t dropped_count = 0;
-	//for (auto& destination_hash : Transport::get_destination_table()) {
-	for (const auto& [destination_hash, destination_entry] : Transport::get_destination_table()) {
-		if (destination_entry._received_from == transport_hash) {
-			Transport::expire_path(destination_hash);
-			++dropped_count;
+	for (const auto& [destination_hash, deque] : Transport::get_destination_table()) {
+		for (const auto& entry : deque) {
+			if (entry.next_hop == transport_hash) {
+				Transport::expire_path(destination_hash);
+				++dropped_count;
+				break;
+			}
 		}
 	}
 	return dropped_count;

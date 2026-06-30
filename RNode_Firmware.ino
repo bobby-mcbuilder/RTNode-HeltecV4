@@ -296,6 +296,159 @@ RTC_NOINIT_ATTR uint32_t bootloop_first_boot_ms;
 #define NODE_HASH_RTC_MAGIC  0x504B4841UL  // "PKHA"
 RTC_NOINIT_ATTR uint32_t rtc_node_hash_magic;
 RTC_NOINIT_ATTR char     rtc_node_hash_hex[33];  // 32 hex chars + NUL
+
+RTC_NOINIT_ATTR BoundaryResetReport boundary_reset_report;
+
+static uint16_t boundary_nominal_path_table_maxsize = 0;
+static uint16_t boundary_nominal_path_table_maxpersist = 0;
+
+bool boundary_reset_report_available() {
+  return boundary_reset_report.magic == BOUNDARY_RESET_REPORT_MAGIC
+      && boundary_reset_report.version == BOUNDARY_RESET_REPORT_VERSION
+      && boundary_reset_report.cause != BOUNDARY_RESET_CAUSE_NONE;
+}
+
+const char* boundary_reset_cause_label(uint8_t cause) {
+  switch (cause) {
+    case BOUNDARY_RESET_CAUSE_HEAP_WATCHDOG: return "Heap watchdog";
+    case BOUNDARY_RESET_CAUSE_WIFI_WATCHDOG: return "WiFi watchdog";
+    default: return "Unknown";
+  }
+}
+
+const char* boundary_heap_stage_label(uint8_t stage) {
+  switch (stage) {
+    case BOUNDARY_HEAP_STAGE_SHED: return "Queue shedding";
+    case BOUNDARY_HEAP_STAGE_TRIM: return "Path-table trim";
+    default: return "None";
+  }
+}
+
+const char* boundary_reset_reason_label(uint8_t reason) {
+  switch (reason) {
+    case 0: return "Pending";
+    case POWERON_RESET: return "Power-on";
+    case RTC_SW_SYS_RESET: return "Software reset";
+    case DEEPSLEEP_RESET: return "Deep sleep wake";
+    case TG0WDT_SYS_RESET: return "Timer group 0 watchdog";
+    case TG1WDT_SYS_RESET: return "Timer group 1 watchdog";
+    case RTCWDT_SYS_RESET: return "RTC watchdog";
+    case INTRUSION_RESET: return "Brownout/intrusion";
+    case TG0WDT_CPU_RESET: return "CPU watchdog (TG0)";
+    case TG1WDT_CPU_RESET: return "CPU watchdog (TG1)";
+    case RTC_SW_CPU_RESET: return "CPU software reset";
+    case RTCWDT_CPU_RESET: return "RTC CPU watchdog";
+    case RTCWDT_BROWN_OUT_RESET: return "Brownout";
+    case RTCWDT_RTC_RESET: return "RTC reset";
+    case SUPER_WDT_RESET: return "Super watchdog";
+    case GLITCH_RTC_RESET: return "Clock glitch";
+    case EFUSE_RESET: return "eFuse CRC";
+    case USB_UART_CHIP_RESET: return "USB UART reset";
+    case USB_JTAG_CHIP_RESET: return "USB JTAG reset";
+    case POWER_GLITCH_RESET: return "Power glitch";
+    default: return "Other";
+  }
+}
+
+static void boundary_clear_reset_report() {
+  memset(&boundary_reset_report, 0, sizeof(boundary_reset_report));
+}
+
+static void boundary_note_reset_report_boot_reason() {
+  uint8_t reset_reason = (uint8_t)rtc_get_reset_reason(0);
+
+  if (reset_reason == POWERON_RESET) {
+    boundary_clear_reset_report();
+    return;
+  }
+
+  if (boundary_reset_report_available() && boundary_reset_report.observed_reset_reason == 0) {
+    boundary_reset_report.observed_reset_reason = reset_reason;
+    Serial.printf("[Boundary] Last automatic reset: %s, observed=%s, heap=%lu, min=%lu, max_alloc=%lu\r\n",
+                  boundary_reset_cause_label(boundary_reset_report.cause),
+                  boundary_reset_reason_label(boundary_reset_report.observed_reset_reason),
+                  boundary_reset_report.free_heap,
+                  boundary_reset_report.min_free_heap,
+                  boundary_reset_report.max_alloc_heap);
+  }
+}
+
+static void boundary_capture_reset_report(uint8_t cause, uint8_t heap_stage, uint32_t free_heap, int32_t wifi_status) {
+  boundary_reset_report.magic = BOUNDARY_RESET_REPORT_MAGIC;
+  boundary_reset_report.version = BOUNDARY_RESET_REPORT_VERSION;
+  boundary_reset_report.cause = cause;
+  boundary_reset_report.heap_stage = heap_stage;
+  boundary_reset_report.observed_reset_reason = 0;
+  boundary_reset_report.uptime_ms = millis();
+  boundary_reset_report.free_heap = free_heap;
+  boundary_reset_report.min_free_heap = ESP.getMinFreeHeap();
+  boundary_reset_report.max_alloc_heap = ESP.getMaxAllocHeap();
+  boundary_reset_report.wifi_status = wifi_status;
+  boundary_reset_report.path_table_maxsize = RNS::Transport::path_table_maxsize();
+  boundary_reset_report.path_table_maxpersist = RNS::Transport::probe_destination_enabled();
+  boundary_reset_report.bridged_lora_to_tcp = firewall_state.packets_bridged_lora_to_tcp;
+  boundary_reset_report.bridged_tcp_to_lora = firewall_state.packets_bridged_tcp_to_lora;
+}
+
+static void boundary_restore_path_caps_if_needed() {
+  if (boundary_nominal_path_table_maxsize == 0 || boundary_nominal_path_table_maxpersist == 0) {
+    return;
+  }
+
+  if (RNS::Transport::path_table_maxsize() != boundary_nominal_path_table_maxsize ||
+      RNS::Transport::probe_destination_enabled() != boundary_nominal_path_table_maxpersist) {
+    RNS::Transport::path_table_maxsize(boundary_nominal_path_table_maxsize);
+    RNS::Transport::path_table_maxpersist(boundary_nominal_path_table_maxpersist);
+    RNS::Transport::cull_path_table();
+  }
+}
+
+static void boundary_trim_path_caps_for_pressure() {
+  if (boundary_nominal_path_table_maxsize == 0 || boundary_nominal_path_table_maxpersist == 0) {
+    return;
+  }
+
+  uint16_t trimmed_maxsize = boundary_nominal_path_table_maxsize;
+  if (trimmed_maxsize > 8) {
+    trimmed_maxsize = trimmed_maxsize / 2;
+    if (trimmed_maxsize < 8) {
+      trimmed_maxsize = 8;
+    }
+  }
+
+  uint16_t trimmed_maxpersist = boundary_nominal_path_table_maxpersist;
+  if (trimmed_maxpersist > 4) {
+    trimmed_maxpersist = trimmed_maxpersist / 2;
+    if (trimmed_maxpersist < 4) {
+      trimmed_maxpersist = 4;
+    }
+  }
+
+  if (trimmed_maxpersist > trimmed_maxsize) {
+    trimmed_maxpersist = trimmed_maxsize;
+  }
+
+  if (trimmed_maxsize < RNS::Transport::path_table_maxsize() ||
+      trimmed_maxpersist < RNS::Transport::probe_destination_enabled()) {
+    RNS::Transport::path_table_maxsize(trimmed_maxsize);
+    RNS::Transport::path_table_maxpersist(trimmed_maxpersist);
+    RNS::Transport::cull_path_table();
+  }
+}
+
+static void boundary_apply_heap_relief(uint8_t heap_stage) {
+  if (heap_stage >= BOUNDARY_HEAP_STAGE_SHED) {
+    RNS::Transport::drop_announce_queues();
+    RNS::Transport::clear_caches_in_memory();  // clear packet hashlist, global blobs, rate table
+  }
+
+  if (heap_stage >= BOUNDARY_HEAP_STAGE_TRIM) {
+    boundary_trim_path_caps_for_pressure();
+  }
+
+  RNS::Transport::clean_caches();
+  RNS::Transport::cull_path_table();
+}
 #endif
 
 #endif  // HAS_RNS
@@ -317,6 +470,10 @@ void setup() {
   }
   // CBA Test
   delay(2000);
+
+  #ifdef FIREWALL_MODE
+    boundary_note_reset_report_boot_reason();
+  #endif
 
   // Configure WDT
   #if MCU_VARIANT == MCU_ESP32
@@ -828,11 +985,12 @@ void setup() {
       // ── Firewall Mode: Load config and optionally set up WiFi + TCP ──
       HEAD("Firewall Mode: Initializing...", RNS::LOG_TRACE);
 
-      // ESP32 has only ~324KB heap. Each path entry with random_blobs costs
-      // ~200-500 bytes. Keep tables small to avoid heap exhaustion.
-      // cull_path_table() evicts backbone paths first, preserving local ones.
-      RNS::Transport::path_table_maxsize(24);
-      RNS::Transport::path_table_maxpersist(12);
+      // ESP32 has only ~324KB heap. Keep tables small to avoid heap exhaustion.
+      // With multi-path (N=2), each dest holds up to 2 PathEntry objects (~80 bytes each).
+      RNS::Transport::path_table_maxsize(16);
+      RNS::Transport::path_table_maxpersist(8);
+      boundary_nominal_path_table_maxsize = RNS::Transport::path_table_maxsize();
+      boundary_nominal_path_table_maxpersist = RNS::Transport::probe_destination_enabled();
       firewall_load_config();
 
       // Set up IFAC on the LoRa interface if configured
@@ -850,7 +1008,7 @@ void setup() {
       }
 
       // All interfaces use GATEWAY — allows announce forwarding in all modes
-      lora_interface.mode(RNS::Type::Interface::MODE_GATEWAY);
+      lora_interface.mode(RNS::Type::Interface::MODE_FULL);
 
       // Start WiFi if enabled
       if (firewall_state.wifi_enabled) {
@@ -892,7 +1050,7 @@ void setup() {
               iface_name
           );
           tcp_rns_interfaces[slot] = tcp_interface_ptrs[slot];
-          tcp_rns_interfaces[slot].mode(RNS::Type::Interface::MODE_BOUNDARY);
+          tcp_rns_interfaces[slot].mode(RNS::Type::Interface::MODE_FULL);
           tcp_rns_interfaces[slot].is_backbone(true);
           RNS::Transport::register_interface(tcp_rns_interfaces[slot]);
           configured_backbones++;
@@ -921,7 +1079,7 @@ void setup() {
         // to prevent unnecessary reconnection cycles that leak lwIP memory
         local_tcp_interface_ptr->setReadTimeout(600000);
         local_tcp_rns_interface = local_tcp_interface_ptr;
-        local_tcp_rns_interface.mode(RNS::Type::Interface::MODE_GATEWAY);
+        local_tcp_rns_interface.mode(RNS::Type::Interface::MODE_FULL);
         RNS::Transport::register_interface(local_tcp_rns_interface);
         // Register as local client interface so Transport forwards
         // announces, link packets, and proofs to TCP clients
@@ -1020,7 +1178,7 @@ void setup() {
 #ifdef FIREWALL_MODE
       HEAD("*** FIREWALL MODE ACTIVE ***", RNS::LOG_TRACE);
       HEAD("RNS transport is ENABLED (firewall mode active)", RNS::LOG_TRACE);
-      HEAD("LoRa Interface: MODE_GATEWAY", RNS::LOG_TRACE);
+      HEAD("LoRa Interface: MODE_FULL", RNS::LOG_TRACE);
       {
         char _bm_info[128];
         if (firewall_any_backbone_enabled()) {
@@ -1031,7 +1189,7 @@ void setup() {
           HEAD("TCP Backbones: DISABLED", RNS::LOG_TRACE);
         }
         if (firewall_state.ap_tcp_enabled) {
-          snprintf(_bm_info, sizeof(_bm_info), "Local TCP Server: port %d (MODE_GATEWAY)",
+          snprintf(_bm_info, sizeof(_bm_info), "Local TCP Server: port %d (FULL mode)",
                    firewall_state.ap_tcp_port);
           HEAD(_bm_info, RNS::LOG_TRACE);
         }
@@ -2562,11 +2720,46 @@ void loop() {
     static bool     _wifi_watchdog_armed  = false;  // armed once WiFi first connects
     static uint32_t _wifi_lost_at         = 0;      // millis() when WiFi first lost
     static const uint32_t WIFI_GRACE_MS   = 15000;  // 15s grace before reboot
+    static const uint32_t HEAP_PRESSURE   = 28000;  // proactive cleanup before WiFi buffers starve
+    static const uint32_t HEAP_SEVERE     = 24000;  // trim path tables before restart threshold
     static const uint32_t HEAP_CRITICAL   = 20000;  // 20KB minimum internal heap
+    static const uint32_t HEAP_RECOVERY   = 34000;  // hysteresis before restoring normal caps
+    static uint8_t  _heap_pressure_stage  = BOUNDARY_HEAP_STAGE_NONE;
 
     // ── Heap pressure check (runs always) ─────────────────────────────────
     uint32_t free_heap = ESP.getFreeHeap();
+    if (_heap_pressure_stage == BOUNDARY_HEAP_STAGE_NONE && free_heap < HEAP_PRESSURE) {
+      Serial.printf("\r\n[WATCHDOG] HEAP PRESSURE: %u < %u — shedding announce/cache state\r\n",
+                    free_heap, HEAP_PRESSURE);
+      boundary_apply_heap_relief(BOUNDARY_HEAP_STAGE_SHED);
+      RNS::Transport::dump_stats();
+      _heap_pressure_stage = BOUNDARY_HEAP_STAGE_SHED;
+      free_heap = ESP.getFreeHeap();
+      Serial.printf("[WATCHDOG] Heap after shedding: %u\r\n", free_heap);
+    }
+
+    if (_heap_pressure_stage < BOUNDARY_HEAP_STAGE_TRIM && free_heap < HEAP_SEVERE) {
+      Serial.printf("[WATCHDOG] HEAP SEVERE: %u < %u — trimming path-table caps\r\n",
+                    free_heap, HEAP_SEVERE);
+      boundary_apply_heap_relief(BOUNDARY_HEAP_STAGE_TRIM);
+      _heap_pressure_stage = BOUNDARY_HEAP_STAGE_TRIM;
+      free_heap = ESP.getFreeHeap();
+      Serial.printf("[WATCHDOG] Heap after trim: %u (path caps %u/%u)\r\n",
+                    free_heap,
+                    RNS::Transport::path_table_maxsize(),
+                    RNS::Transport::probe_destination_enabled());
+    }
+
     if (free_heap < HEAP_CRITICAL) {
+      boundary_apply_heap_relief(_heap_pressure_stage >= BOUNDARY_HEAP_STAGE_TRIM
+                                   ? BOUNDARY_HEAP_STAGE_TRIM
+                                   : BOUNDARY_HEAP_STAGE_SHED);
+      free_heap = ESP.getFreeHeap();
+
+      if (free_heap >= HEAP_CRITICAL) {
+        Serial.printf("[WATCHDOG] Heap recovered to %u after emergency relief\r\n", free_heap);
+      } else {
+        boundary_capture_reset_report(BOUNDARY_RESET_CAUSE_HEAP_WATCHDOG, _heap_pressure_stage, free_heap, (int32_t)WiFi.status());
       Serial.printf("\r\n[WATCHDOG] CRITICAL: Free heap %u < %u — REBOOTING\r\n",
                     free_heap, HEAP_CRITICAL);
       Serial.printf("[WATCHDOG] Min free: %u  Max alloc: %u\r\n",
@@ -2574,6 +2767,12 @@ void loop() {
       Serial.flush();
       delay(100);
       ESP.restart();
+      }
+    } else if (_heap_pressure_stage != BOUNDARY_HEAP_STAGE_NONE && free_heap > HEAP_RECOVERY) {
+      boundary_restore_path_caps_if_needed();
+      Serial.printf("[WATCHDOG] Heap recovered: %u > %u — restored steady-state caps\r\n",
+                    free_heap, HEAP_RECOVERY);
+      _heap_pressure_stage = BOUNDARY_HEAP_STAGE_NONE;
     }
 
     bool wifi_now = wifi_is_connected();
@@ -2595,6 +2794,7 @@ void loop() {
       }
       // Check if grace period expired — unrecoverable, reboot
       if ((millis() - _wifi_lost_at) >= WIFI_GRACE_MS) {
+        boundary_capture_reset_report(BOUNDARY_RESET_CAUSE_WIFI_WATCHDOG, _heap_pressure_stage, ESP.getFreeHeap(), (int32_t)WiFi.status());
         Serial.printf("\r\n[WATCHDOG] WiFi down %lu ms — REBOOTING\r\n",
                       millis() - _wifi_lost_at);
         Serial.printf("[WATCHDOG] WiFi.status()=%d heap=%u\r\n",

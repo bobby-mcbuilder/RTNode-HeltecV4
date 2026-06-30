@@ -30,6 +30,44 @@
 extern uint32_t rtc_node_hash_magic;
 extern char     rtc_node_hash_hex[33];
 
+#define BOUNDARY_RESET_REPORT_MAGIC    0x42525054UL
+#define BOUNDARY_RESET_REPORT_VERSION  1
+
+enum BoundaryResetCause : uint8_t {
+    BOUNDARY_RESET_CAUSE_NONE = 0,
+    BOUNDARY_RESET_CAUSE_HEAP_WATCHDOG = 1,
+    BOUNDARY_RESET_CAUSE_WIFI_WATCHDOG = 2,
+};
+
+enum BoundaryHeapPressureStage : uint8_t {
+    BOUNDARY_HEAP_STAGE_NONE = 0,
+    BOUNDARY_HEAP_STAGE_SHED = 1,
+    BOUNDARY_HEAP_STAGE_TRIM = 2,
+};
+
+struct BoundaryResetReport {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t cause;
+    uint8_t heap_stage;
+    uint8_t observed_reset_reason;
+    uint32_t uptime_ms;
+    uint32_t free_heap;
+    uint32_t min_free_heap;
+    uint32_t max_alloc_heap;
+    int32_t wifi_status;
+    uint16_t path_table_maxsize;
+    uint16_t path_table_maxpersist;
+    uint32_t bridged_lora_to_tcp;
+    uint32_t bridged_tcp_to_lora;
+};
+
+extern BoundaryResetReport boundary_reset_report;
+bool boundary_reset_report_available();
+const char* boundary_reset_cause_label(uint8_t cause);
+const char* boundary_heap_stage_label(uint8_t stage);
+const char* boundary_reset_reason_label(uint8_t reason);
+
 // ─── Config Portal State ─────────────────────────────────────────────────────
 static bool config_portal_active = false;
 static WebServer* config_server = nullptr;
@@ -137,6 +175,13 @@ static void config_send_html() {
         ".node-hash .nh-label{display:block;font-size:0.75em;color:#888;margin-bottom:4px;}"
         ".node-hash code{font-family:monospace;font-size:0.95em;color:#7ecfff;"
         "word-break:break-all;letter-spacing:0.05em;}"
+        ".reset-report{background:#241d12;border:1px solid #6b4f1d;border-radius:6px;"
+        "padding:12px 14px;margin:0 0 16px;}"
+        ".reset-report .rr-title{display:block;font-size:0.8em;color:#f4c87a;margin-bottom:8px;}"
+        ".reset-report .rr-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 12px;}"
+        ".reset-report .rr-key{font-size:0.78em;color:#b8a98b;}"
+        ".reset-report .rr-val{font-family:monospace;font-size:0.9em;color:#f8e7c2;word-break:break-word;}"
+        ".reset-report .rr-note{font-size:0.78em;color:#b8a98b;margin-top:10px;}"
         "</style></head><body>"
         "<h1>&#x1f4e1; RTNode</h1>"
     );
@@ -150,6 +195,61 @@ static void config_send_html() {
     }
     html += F("</code></div>");
 
+    if (boundary_reset_report_available()) {
+        html += F("<div class='reset-report'><span class='rr-title'>&#x26a0; Last automatic reset report</span><div class='rr-grid'>");
+
+        html += F("<div><div class='rr-key'>Trigger</div><div class='rr-val'>");
+        html += String(boundary_reset_cause_label(boundary_reset_report.cause));
+        html += F("</div></div>");
+
+        html += F("<div><div class='rr-key'>Observed reset</div><div class='rr-val'>");
+        html += String(boundary_reset_reason_label(boundary_reset_report.observed_reset_reason));
+        if (boundary_reset_report.observed_reset_reason != 0) {
+            html += F(" (");
+            html += String((unsigned)boundary_reset_report.observed_reset_reason);
+            html += F(")");
+        }
+        html += F("</div></div>");
+
+        html += F("<div><div class='rr-key'>Heap stage</div><div class='rr-val'>");
+        html += String(boundary_heap_stage_label(boundary_reset_report.heap_stage));
+        html += F("</div></div>");
+
+        html += F("<div><div class='rr-key'>Uptime at reset</div><div class='rr-val'>");
+        html += String(boundary_reset_report.uptime_ms / 1000UL);
+        html += F(" s</div></div>");
+
+        html += F("<div><div class='rr-key'>Free heap</div><div class='rr-val'>");
+        html += String(boundary_reset_report.free_heap);
+        html += F(" B</div></div>");
+
+        html += F("<div><div class='rr-key'>Min free heap</div><div class='rr-val'>");
+        html += String(boundary_reset_report.min_free_heap);
+        html += F(" B</div></div>");
+
+        html += F("<div><div class='rr-key'>Max alloc heap</div><div class='rr-val'>");
+        html += String(boundary_reset_report.max_alloc_heap);
+        html += F(" B</div></div>");
+
+        html += F("<div><div class='rr-key'>WiFi status</div><div class='rr-val'>");
+        html += String(boundary_reset_report.wifi_status);
+        html += F("</div></div>");
+
+        html += F("<div><div class='rr-key'>Path caps</div><div class='rr-val'>");
+        html += String(boundary_reset_report.path_table_maxsize);
+        html += F("/");
+        html += String(boundary_reset_report.path_table_maxpersist);
+        html += F("</div></div>");
+
+        html += F("<div><div class='rr-key'>Bridge counters</div><div class='rr-val'>L-&gt;T ");
+        html += String(boundary_reset_report.bridged_lora_to_tcp);
+        html += F(" / T-&gt;L ");
+        html += String(boundary_reset_report.bridged_tcp_to_lora);
+        html += F("</div></div>");
+
+        html += F("</div><div class='rr-note'>Captured before an automatic reboot. Clears on power cycle.</div></div>");
+    }
+
     html += F("<form method='POST' action='/save'>");
 
     // ── Node Name Section ──
@@ -162,33 +262,6 @@ static void config_send_html() {
         "<input name='node_name' maxlength='32' placeholder='e.g. My RNode' value='"
     );
     html += String(firewall_state.node_name);
-    html += F("'>");
-
-    // ── mDNS Hostname Section ──
-    html += F(
-        "<h2>&#x1f310; Local Network Name (mDNS)</h2>"
-        "<p class='note'>Publishes the device on the local network so you can reach it as "
-        "<code>&lt;name&gt;.local</code> from any computer in your LAN without knowing its IP. "
-        "Disable to suppress all multicast announcements.</p>"
-        "<label>mDNS</label>"
-        "<select name='mdns_en'>"
-    );
-    html += F("<option value='1'");
-    if (firewall_state.mdns_enabled) html += F(" selected");
-    html += F(">Enabled</option>");
-    html += F("<option value='0'");
-    if (!firewall_state.mdns_enabled) html += F(" selected");
-    html += F(">Disabled</option>");
-    html += F("</select>");
-
-    html += F(
-        "<label>Hostname</label>"
-        "<p class='note'>Leave blank for the default <code>rtnode&lt;XXXX&gt;.local</code> "
-        "(last 4 hex chars of the device MAC). "
-        "Allowed: lowercase letters, digits and hyphens; first/last char must be alphanumeric.</p>"
-        "<input name='mdns_name' maxlength='32' placeholder='rtnode' value='"
-    );
-    html += String(firewall_state.mdns_hostname);
     html += F("'>");
 
     html += F(
@@ -270,6 +343,31 @@ static void config_send_html() {
     html += F("<label>TCP Port</label>");
     html += F("<input name='ap_tcp_port' type='number' min='1' max='65535' value='");
     html += String(firewall_state.ap_tcp_port);
+    html += F("'>");
+
+    html += F(
+        "<label>Local Network Name (mDNS)</label>"
+        "<p class='note'>Publishes the device on the local network so you can reach it as "
+        "<code>&lt;name&gt;.local</code> from any computer in your LAN without knowing its IP. "
+        "This applies to the node itself and local TCP access, even if the TCP server is disabled.</p>"
+        "<select name='mdns_en'>"
+    );
+    html += F("<option value='1'");
+    if (firewall_state.mdns_enabled) html += F(" selected");
+    html += F(">Enabled</option>");
+    html += F("<option value='0'");
+    if (!firewall_state.mdns_enabled) html += F(" selected");
+    html += F(">Disabled</option>");
+    html += F("</select>");
+
+    html += F(
+        "<label>mDNS Hostname</label>"
+        "<p class='note'>Leave blank for the default <code>rtnode&lt;XXXX&gt;.local</code> "
+        "(last 4 hex chars of the device MAC). "
+        "Allowed: lowercase letters, digits and hyphens; first/last char must be alphanumeric.</p>"
+        "<input name='mdns_name' maxlength='32' placeholder='rtnode' value='"
+    );
+    html += String(firewall_state.mdns_hostname);
     html += F("'>");
 
     // ── LoRa Radio Section ──

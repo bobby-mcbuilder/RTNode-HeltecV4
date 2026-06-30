@@ -10,6 +10,7 @@
 
 #include <map>
 #include <vector>
+#include <deque>
 #include <set>
 #include <string>
 
@@ -270,6 +271,62 @@ namespace ArduinoJson {
 	};
 
 #if 1
+	// ArduinoJSON serialization support for std::deque<T>
+	template <typename T>
+	struct Converter<std::deque<T>> {
+		static void toJson(const std::deque<T>& src, JsonVariant dst) {
+			JsonArray array = dst.to<JsonArray>();
+			for (const T& item : src)
+				array.add(item);
+		}
+		static std::deque<T> fromJson(JsonVariantConst src) {
+			std::deque<T> dst;
+			for (JsonVariantConst item : src.as<JsonArrayConst>())
+				dst.push_back(item.template as<T>());
+			return dst;
+		}
+		static bool checkJson(JsonVariantConst src) {
+			JsonArrayConst array = src;
+			bool result = array;
+			for (JsonVariantConst item : array)
+				result &= item.is<T>();
+			return result;
+		}
+	};
+
+	// ArduinoJSON serialization support for RNS::Transport::PathEntry
+	template <>
+	struct Converter<RNS::Transport::PathEntry> {
+		static bool toJson(const RNS::Transport::PathEntry& src, JsonVariant dst) {
+			dst["timestamp"] = src.timestamp;
+			dst["next_hop"] = src.next_hop;
+			dst["hops"] = src.hops;
+			dst["expires"] = src.expires;
+			dst["interface_hash"] = src.receiving_interface;
+			dst["packet_hash"] = src.packet_hash;
+			return true;
+		}
+		static RNS::Transport::PathEntry fromJson(JsonVariantConst src) {
+			RNS::Transport::PathEntry dst;
+			dst.timestamp = src["timestamp"];
+			dst.next_hop = src["next_hop"];
+			dst.hops = src["hops"];
+			dst.expires = src["expires"];
+			dst.receiving_interface = src["interface_hash"];
+			dst.packet_hash = src["packet_hash"];
+			return dst;
+		}
+		static bool checkJson(JsonVariantConst src) {
+			return src["timestamp"].is<double>() &&
+				src["next_hop"].is<RNS::Bytes>() &&
+				src["hops"].is<uint8_t>() &&
+				src["expires"].is<double>() &&
+				src["interface_hash"].is<RNS::Bytes>() &&
+				src["packet_hash"].is<RNS::Bytes>();
+		}
+	};
+
+	// ── Legacy DestinationEntry converter (kept for tunnel serialisation) ──
 	// ArduinoJSON serialization support for RNS::Transport::DestinationEntry
 	template <>
 	struct Converter<RNS::Transport::DestinationEntry> {

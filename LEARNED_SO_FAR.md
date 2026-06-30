@@ -639,9 +639,9 @@ Reverse direction, V4.3 -> V4.2:
   - LAN TCP proof server no longer learned those WAN flood destinations and no longer logged the random path requests
   - however, `bma` still climbed during the random WAN path-request flood because the "mentioned" set was still learning non-address identifiers such as the control destination and proof hashes
 - Final refinement requested by user and validated on hardware:
-  - tightened whitelist growth to actual addresses only
-  - added `is_boundary_address_packet(packet)` and only allow whitelist growth for `destination_type == SINGLE` and `packet_type != PROOF`
-  - this stopped plain control destinations and proof packet hashes from entering the boundary whitelist state
+  - tightened whitelist growth so WAN flood control hashes were no longer entering boundary state
+  - that intermediate implementation used `is_boundary_address_packet(packet)` to avoid learning plain control destinations and proof packet hashes from WAN flood traffic
+  - this helper-based narrowing was later superseded by the simpler destination-centric contract documented below: every destination the LAN mentions is whitelisted, and path requests whitelist their payload target rather than the `path.request` wrapper hash
 - Final hardware validation on the refined firmware:
   - LAN TCP proof server hash: `703d29c1883e35f48c25beef9ee00b89`
   - WAN flood script again sent four unsolicited LoRa announces and twenty random LoRa path requests
@@ -662,6 +662,21 @@ Reverse direction, V4.3 -> V4.2:
   - random unknown LoRa/WAN path requests no longer leak to LAN TCP clients
   - the boundary whitelist no longer grows from WAN flood control/proof identifiers
   - valid LoRa-to-LAN access still works after the flood, which is the required behavior for the two-whitelist policy
+
+## 2026-05-10 Boundary Whitelist Rule Simplified And Hardened
+
+- The durable rule is now: every destination the LAN mentions goes in the whitelist.
+- The firewall must key that rule to the real destination referenced by the packet, not blindly to `packet.destination_hash()` when the packet is only a wrapper around another destination.
+- The critical special case is a path request:
+  - the wrapper packet is sent to the shared `path.request` control destination
+  - the actual destination the LAN mentioned is the first 16 bytes of the payload
+  - whitelist admission and learning must therefore use that payload hash
+- For other trusted LAN packets, the destination the LAN mentioned is simply `packet.destination_hash()`. That includes announces, proofs, link traffic, and ordinary messages.
+- WAN-side admission is now aligned to the same rule:
+  - whitelisted destinations are allowed through regardless of whether they arrive as announces, path requests, proofs, or messages
+  - reverse-table and link-table state still allow established return traffic for active flows
+  - unsolicited WAN announces may still be buffered in bounded `_held_announces`, but they are not promoted into live path state unless the destination is already whitelisted or a waiting LAN discovery request asks for it
+- Do not reintroduce helper logic that narrows whitelist learning to a subset of packet types. The invariant is destination-centric: if the LAN mentioned that destination, it belongs in the whitelist.
 
 ## 2026-05-10 Proof Harness Orchestrator Added; Current Execution State
 
