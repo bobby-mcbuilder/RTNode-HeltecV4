@@ -204,7 +204,6 @@ namespace RNS {
 		void handle_response(const Bytes& request_id, const Bytes& response_data, size_t response_size, size_t response_transfer_size);
 		void request_resource_concluded(const Resource& resource);
 		void response_resource_concluded(const Resource& resource);
-		//z const Channel& get_channel();
 		void receive(const Packet& packet);
 		const Bytes encrypt(const Bytes& plaintext);
 		const Bytes decrypt(const Bytes& ciphertext);

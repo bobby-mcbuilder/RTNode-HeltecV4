@@ -93,7 +93,6 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 			signalling_bytes = Link::signalling_bytes(RNS::Type::Reticulum::MTU, _object->_mode);
 		}
 		TRACEF("Establishing link with mode %d", _object->_mode);
-        //p self.request_data = self.pub_bytes+self.sig_pub_bytes+signalling_bytes
 		_object->_request_data = _object->_pub_bytes + _object->_sig_pub_bytes + signalling_bytes;
 		_object->_packet = Packet(destination, _object->_request_data, RNS::Type::Packet::LINKREQUEST);
 		_object->_packet.pack();
@@ -117,11 +116,8 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 
 
 /*static*/ Bytes Link::signalling_bytes(uint16_t mtu, link_mode mode) {
-	//p if not mode in Link.ENABLED_MODES: raise TypeError(f"Requested link mode {Link.MODE_DESCRIPTIONS[mode]} not enabled")
 	//if (!(mode & ENABLED_MODES)) throw std::runtime_error("Requested link mode "+std::to_string(mode)+" not enabled");
 	if (Link::ENABLED_MODES.find(mode) == Link::ENABLED_MODES.end()) throw std::runtime_error("Requested link mode "+std::to_string(mode)+" not enabled");
-	//p signalling_value = (mtu & Link.MTU_BYTEMASK)+(((mode<<5) & Link.MODE_BYTEMASK)<<16)
-	//p return struct.pack(">I", signalling_value)[1:]
 	uint32_t signalling_value = OS::portable_htonl((mtu & MTU_BYTEMASK)+(((mode<<5) & MODE_BYTEMASK)<<16));
 	Bytes data(((uint8_t*)&signalling_value)+1, 3);
 	return data;
@@ -135,7 +131,6 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 }
 
 /*static*/ uint16_t Link::mtu_from_lp_packet(const Packet& packet) {
-	//p if len(packet.data) == RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE:
 	if (packet.data().size() == RNS::Type::Identity::SIGLENGTH/8+ECPUBSIZE/2+LINK_MTU_SIZE) {
 		Bytes mtu_bytes = packet.data().mid(RNS::Type::Identity::SIGLENGTH/8+ECPUBSIZE/2, LINK_MTU_SIZE);
 		return (mtu_bytes[0] << 16) + (mtu_bytes[1] << 8) + (mtu_bytes[2]) & MTU_BYTEMASK;
@@ -144,7 +139,6 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 }
 
 /*static*/ uint8_t Link::mode_byte(link_mode mode) {
-	//p if mode in Link.ENABLED_MODES: return (mode << 5) & Link.MODE_BYTEMASK
 	if (Link::ENABLED_MODES.find(mode) != Link::ENABLED_MODES.end()) return (mode << 5) & MODE_BYTEMASK;
 	throw std::runtime_error("Requested link mode {mode} not enabled");
 }
@@ -169,7 +163,6 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 	Bytes hashable_part = packet.get_hashable_part();
 	if (packet.data().size() > ECPUBSIZE) {
 		size_t diff = packet.data().size() - ECPUBSIZE;
-		//p hashable_part = hashable_part[:-diff]
 		hashable_part = hashable_part.left(hashable_part.size() - diff);
 	}
 	return RNS::Identity::truncated_hash(hashable_part);
@@ -317,20 +310,15 @@ void Link::validate_proof(const Packet& packet) {
 			link_mode mode = mode_from_lp_packet(packet);
 			DEBUGF("Validating link request proof with mode %d", mode);
 			if (mode != _object->_mode) throw std::runtime_error("Invalid link mode "+std::to_string(mode)+" in link request proof");
-            //p if len(packet.data) == RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE:
 			if (packet_data.size() == Type::Identity::SIGLENGTH/8+ECPUBSIZE/2+RNS::Type::Link::LINK_MTU_SIZE) {
 				confirmed_mtu = Link::mtu_from_lp_packet(packet);
 				signalling_bytes = Link::signalling_bytes(confirmed_mtu, mode);
 				// CBA TODO Determine best way to deal with packet.data() being read-only
-				//p packet.data = packet.data[:RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2]
 				packet_data = packet_data.left(RNS::Type::Identity::SIGLENGTH/8+ECPUBSIZE/2);
 				DEBUGF("Destination confirmed link MTU of %d", confirmed_mtu);
 			}
-			//p if _object->_initiator and len(packet.data) == RNS.Identity.SIGLENGTH//8+ECPUBSIZE//2:
 			if (_object->_initiator && packet_data.size() == Type::Identity::SIGLENGTH/8+ECPUBSIZE/2) {
-				//p peer_pub_bytes = packet.data[RNS.Identity.SIGLENGTH//8:RNS.Identity.SIGLENGTH//8+ECPUBSIZE//2]
 				const Bytes peer_pub_bytes(packet_data.mid(Type::Identity::SIGLENGTH/8, ECPUBSIZE/2));
-				//p peer_sig_pub_bytes = _object->_destination.identity.get_public_key()[ECPUBSIZE//2:ECPUBSIZE]
 				const Bytes peer_sig_pub_bytes(_object->_destination.identity().get_public_key().mid(ECPUBSIZE/2, ECPUBSIZE/2));
 				TRACEF("Link %s performing handshake", link_id().toHex().c_str());
 				load_peer(peer_pub_bytes, peer_sig_pub_bytes);
@@ -357,17 +345,14 @@ void Link::validate_proof(const Packet& packet) {
 					Transport::activate_link(*this);
 					VERBOSEF("Link %s established with %s, RTT is %f s", toString().c_str(), _object->_destination.toString().c_str(), OS::round(_object->_rtt, 3));
 					
-					//p if _object->_rtt != None and _object->_establishment_cost != None and _object->_rtt > 0 and _object->_establishment_cost > 0:
 					if (_object->_rtt != 0.0 && _object->_establishment_cost != 0 && _object->_rtt > 0 and _object->_establishment_cost > 0) {
 						_object->_establishment_rate = _object->_establishment_cost / _object->_rtt;
 					}
 
-                    //p rtt_data = umsgpack.packb(self.rtt)
 					MsgPack::Packer packer;
 					packer.serialize(_object->_rtt);
 					Bytes rtt_data(packer.data(), packer.size());
 TRACEF("***** RTT data size: %d", rtt_data.size());
-                    //p rtt_packet = RNS.Packet(self, rtt_data, context=RNS.Packet.LRRTT)
 					Packet rtt_packet(*this, rtt_data, Type::Packet::DATA, Type::Packet::LRRTT);
 TRACEF("***** RTT packet data: %s", rtt_packet.data().toHex().c_str());
 rtt_packet.pack();
@@ -383,9 +368,6 @@ TRACEF("***** RTT test packet plaintext: %s", plaintext.toHex().c_str());
 
 					if (_object->_callbacks._established != nullptr) {
 						VERBOSEF("Link %s is established", link_id().toHex().c_str());
-						//p thread = threading.Thread(target=_object->_callbacks.link_established, args=(self,))
-						//p thread.daemon = True
-						//p thread.start()
 						_object->_callbacks._established(*this);
 					}
 				}
@@ -443,8 +425,6 @@ const RNS::RequestReceipt Link::request(const Bytes& path, const Bytes& data /*=
 	DEBUGF("Link %s sending request", link_id().toHex().c_str());
 	const Bytes request_path_hash(Identity::truncated_hash(path));
 
-	//p unpacked_request = [OS::time(), request_path_hash, data]
-	//p packed_request = umsgpack.packb(unpacked_request)
     MsgPack::Packer packer;
 	packer.to_array(OS::time(), request_path_hash, data);
 	Bytes packed_request(packer.data(), packer.size());
@@ -496,7 +476,6 @@ const RNS::RequestReceipt Link::request(const Bytes& path, const Bytes& data /*=
 void Link::update_mdu() {
 	assert(_object);
 	_object->_mdu = _object->_mtu - RNS::Type::Reticulum::HEADER_MAXSIZE - RNS::Type::Reticulum::IFAC_MIN_SIZE;
-    //p self.mdu = math.floor((self.mtu-RNS.Reticulum.IFAC_MIN_SIZE-RNS.Reticulum.HEADER_MINSIZE-RNS.Identity.TOKEN_OVERHEAD)/RNS.Identity.AES128_BLOCKSIZE)*RNS.Identity.AES128_BLOCKSIZE - 1
 	_object->_mdu = floor((_object->_mtu-RNS::Type::Reticulum::IFAC_MIN_SIZE-RNS::Type::Reticulum::HEADER_MINSIZE-RNS::Type::Identity::TOKEN_OVERHEAD)/RNS::Type::Identity::AES128_BLOCKSIZE)*RNS::Type::Identity::AES128_BLOCKSIZE - 1;
 }
 
@@ -506,7 +485,6 @@ void Link::rtt_packet(const Packet& packet) {
 		double measured_rtt = OS::time() - _object->_request_time;
 		const Bytes plaintext(decrypt(packet.data()));
 		if (plaintext) {
-			//p rtt = umsgpack.unpackb(plaintext)
 			MsgPack::Unpacker unpacker;
 			unpacker.feed(plaintext.data(), plaintext.size());
 			double rtt = 0.0;
@@ -515,7 +493,6 @@ void Link::rtt_packet(const Packet& packet) {
 			_object->_status = Type::Link::ACTIVE;
 			_object->_activated_at = OS::time();
 
-			//p if _object->_rtt != None and _object->_establishment_cost != None and _object->_rtt > 0 and _object->_establishment_cost > 0:
 			if (_object->_rtt != 0.0 && _object->_establishment_cost != 0.0 && _object->_rtt > 0 and _object->_establishment_cost > 0) {
 				_object->_establishment_rate = _object->_establishment_cost / _object->_rtt;
 			}
@@ -541,10 +518,6 @@ void Link::rtt_packet(const Packet& packet) {
 */
 float Link::get_establishment_rate() {
 	assert(_object);
-	//p if _object->_establishment_rate != None:
-	//p 	return _object->_establishment_rate*8
-	//p else:
-	//p 	return None
 	return _object->_establishment_rate*8;
 }
 
@@ -614,7 +587,6 @@ double Link::get_age() {
 */
 double Link::no_inbound_for() {
 	assert(_object);
-	//p activated_at = _object->_activated_at if _object->_activated_at != None else 0
 	double activated_at = _object->_activated_at;
 	double last_inbound = std::max(_object->_last_inbound, activated_at);
 	return (OS::time() - last_inbound);
@@ -738,88 +710,11 @@ void Link::link_closed() {
 
 // CBA TODO Implement watchdog
 void Link::start_watchdog() {
-	//z thread = threading.Thread(target=_object->___watchdog_job)
-	//z thread.daemon = True
-	//z thread.start()
 }
 
-/*p TODO
-
-void Link::__watchdog_job() {
-	assert(_object);
-	while not _object->_status == Type::Link::CLOSED:
-		while (_object->_watchdog_lock):
-			rtt_wait = 0.025
-			if hasattr(self, "rtt") and _object->_rtt:
-				rtt_wait = _object->_rtt
-
-			sleep(max(rtt_wait, 0.025))
-
-		if not _object->_status == Type::Link::CLOSED:
-			# Link was initiated, but no response
-			# from destination yet
-			if _object->_status == PENDING:
-				next_check = _object->_request_time + _object->_establishment_timeout
-				sleep_time = next_check - OS::time()
-				if OS::time() >= _object->_request_time + _object->_establishment_timeout:
-					RNS.log("Link establishment timed out", RNS.LOG_VERBOSE)
-					_object->_status = Type::Link::CLOSED
-					_object->_teardown_reason = TIMEOUT
-					link_closed()
-					sleep_time = 0.001
-
-			elif _object->_status == Type::Link::HANDSHAKE:
-				next_check = _object->_request_time + _object->_establishment_timeout
-				sleep_time = next_check - OS::time()
-				if OS::time() >= _object->_request_time + _object->_establishment_timeout:
-					_object->_status = Type::Link::CLOSED
-					_object->_teardown_reason = TIMEOUT
-					link_closed()
-					sleep_time = 0.001
-
-					if _object->_initiator:
-						RNS.log("Timeout waiting for link request proof", RNS.LOG_DEBUG)
-					else:
-						RNS.log("Timeout waiting for RTT packet from link initiator", RNS.LOG_DEBUG)
-
-			elif _object->_status == Type::Link::ACTIVE:
-				activated_at = _object->_activated_at if _object->_activated_at != None else 0
-				last_inbound = max(max(_object->_last_inbound, _object->_last_proof), activated_at)
-
-				if OS::time() >= last_inbound + _object->_keepalive:
-					if _object->_initiator:
-						send_keepalive()
-
-					if OS::time() >= last_inbound + _object->_stale_time:
-						sleep_time = _object->_rtt * _object->_keepalive_timeout_factor + STALE_GRACE
-						_object->_status = STALE
-					else:
-						sleep_time = _object->_keepalive
-				
-				else:
-					sleep_time = (last_inbound + _object->_keepalive) - OS::time()
-
-			elif _object->_status == STALE:
-				sleep_time = 0.001
-				_object->_status = Type::Link::CLOSED
-				_object->_teardown_reason = TIMEOUT
-				link_closed()
-
-
-			if sleep_time == 0:
-				RNS.log("Warning! Link watchdog sleep time of 0!", RNS.LOG_ERROR)
-			if sleep_time == None or sleep_time < 0:
-				RNS.log("Timing error! Tearing down link "+str(self)+" now.", RNS.LOG_ERROR)
-				teardown()
-				sleep_time = 0.1
-
-			sleep(sleep_time)
-
-*/
 
 void Link::send_keepalive() {
 	assert(_object);
-    //p keepalive_packet = RNS.Packet(self, bytes([0xFF]), context=RNS.Packet.KEEPALIVE)
 	RNS::Packet keepalive_packet(*this, Bytes("\xFF"), Type::Packet::DATA, Type::Packet::KEEPALIVE);
 	keepalive_packet.send();
 	had_outbound(true);
@@ -829,9 +724,6 @@ void Link::handle_request(const Bytes& request_id, const ResourceRequest& resour
 	assert(_object);
 	DEBUGF("Link %s handling request", link_id().toHex().c_str());
 	if (_object->_status == Type::Link::ACTIVE) {
-		//p requested_at = unpacked_request[0]
-		//p path_hash    = unpacked_request[1]
-		//p request_data = unpacked_request[2]
 
 		auto handler_iter = _object->_destination.request_handlers().find(resource_request._path_hash);
 		if (handler_iter != _object->_destination.request_handlers().end()) {
@@ -852,22 +744,14 @@ void Link::handle_request(const Bytes& request_id, const ResourceRequest& resour
 
 			if (allowed) {
 				DEBUGF("Handling request %s for: %s", request_id.toHex().c_str(), request_handler._path.toString().c_str());
-				//p if len(inspect.signature(response_generator).parameters) == 5:
-				//p 	response = response_generator(path, request_data, request_id, _object->__remote_identity, requested_at)
-				//p elif len(inspect.signature(response_generator).parameters) == 6:
-				//p 	response = response_generator(path, request_data, request_id, _object->_link_id, _object->__remote_identity, requested_at)
-				//p else:
-				//p 	raise TypeError("Invalid signature for response generator callback")
 				Bytes response(request_handler._response_generator(request_handler._path, resource_request._request_data, request_id, _object->_link_id, _object->__remote_identity, resource_request._requested_at));
 
 				if (response) {
-					//p packed_response = umsgpack.packb([request_id, response])
 					MsgPack::Packer packer;
 					packer.to_array(request_id, response);
 					Bytes packed_response(packer.data(), packer.size());
 
 					if (packed_response.size() <= MDU) {
-						//p RNS.Packet(self, packed_response, Type::Packet::DATA, context = Type::Packet::RESPONSE).send()
 						RNS::Packet response_packet(*this, packed_response, Type::Packet::DATA, Type::Packet::RESPONSE);
 						response_packet.send();
 					}
@@ -923,9 +807,7 @@ void Link::handle_response(const Bytes& request_id, const Bytes& response_data, 
 void Link::request_resource_concluded(const Resource& resource) {
 	assert(_object);
 	if (resource.status() == Type::Resource::COMPLETE) {
-		//p packed_request = resource.data().read()
 		Bytes packed_request = resource.data();
-		//p unpacked_request = umsgpack.unpackb(packed_request)
 		MsgPack::Unpacker unpacker;
 		unpacker.feed(packed_request.data(), packed_request.size());
 		// CBA TODO OPTIMIZE MSGPACK
@@ -937,11 +819,8 @@ void Link::request_resource_concluded(const Resource& resource) {
 		resource_request._requested_at = requested_at;
 		resource_request._path_hash = path_hash;
 		resource_request._request_data = request_data;
-        //p request_id        = RNS.Identity.truncated_hash(packed_request)
 		Bytes request_id(Identity::truncated_hash(resource.data()));
-		//p request_data = unpacked_request
 
-		//p handle_request(request_id, request_data)
 		handle_request(request_id, resource_request);
 	}
 	else {
@@ -952,11 +831,7 @@ void Link::request_resource_concluded(const Resource& resource) {
 void Link::response_resource_concluded(const Resource& resource) {
 	assert(_object);
 	if (resource.status() == Type::Resource::COMPLETE) {
-		//p packed_response = resource.data.read()
 		Bytes packed_response = resource.data();
-		//p unpacked_response = umsgpack.unpackb(packed_response)
-		//p request_id        = unpacked_response[0]
-		//p response_data     = unpacked_response[1]
 		MsgPack::Unpacker unpacker;
 		unpacker.feed(packed_response.data(), packed_response.size());
 		MsgPack::bin_t<uint8_t> request_id;
@@ -1019,9 +894,6 @@ void Link::receive(const Packet& packet) {
 					const Bytes plaintext = decrypt(packet.data());
 					if (plaintext) {
 						if (_object->_callbacks._packet) {
-							//z thread = threading.Thread(target=_object->_callbacks.packet, args=(plaintext, packet))
-							//z thread.daemon = True
-							//z thread.start()
 							try {
 								_object->_callbacks._packet(plaintext, packet);
 							}
@@ -1082,7 +954,6 @@ void Link::receive(const Packet& packet) {
 						const Bytes request_id = packet.getTruncatedHash();
 						const Bytes packed_request = decrypt(packet.data());
 						if (packed_request) {
-                            //p unpacked_request = umsgpack.unpackb(packed_request)
 							MsgPack::Unpacker unpacker;
 							unpacker.feed(packed_request.data(), packed_request.size());
 							// CBA TODO OPTIMIZE MSGPACK
@@ -1107,10 +978,6 @@ void Link::receive(const Packet& packet) {
 					try {
 						const Bytes packed_response = decrypt(packet.data());
 						if (packed_response) {
-							//p unpacked_response = umsgpack.unpackb(packed_response)
-							//p request_id = unpacked_response[0]
-							//p response_data = unpacked_response[1]
-                            //p transfer_size = len(umsgpack.packb(response_data))-2
 							MsgPack::Unpacker unpacker;
 							unpacker.feed(packed_response.data(), packed_response.size());
 							MsgPack::bin_t<uint8_t> request_id;
@@ -1141,7 +1008,6 @@ void Link::receive(const Packet& packet) {
 /*z
 				case Type::Packet::RESOURCE_ADV:
 				{
-					//p packet.plaintext = decrypt(packet.data)
 					const Bytes plaintext = decrypt(packet.data());
 					if (plaintext) {
 						const_cast<Packet&>(packet).plaintext(plaintext);
@@ -1154,16 +1020,13 @@ void Link::receive(const Packet& packet) {
 								if (pending_request.request_id == request_id) {
 									const Bytes response_resource = Resource::accept(packet, callback=_object->_response_resource_concluded, progress_callback=pending_request.response_resource_progress, request_id = request_id);
 									if (response_resource) {
-										//p if pending_request.response_size == None:
 										if (pending_request.response_size == 0) {
 											pending_request.response_size = ResourceAdvertisement::read_size(packet);
 										}
-										//p if pending_request.response_transfer_size == None:
 										if (pending_request.response_transfer_size == 0) {
 											pending_request.response_transfer_size = 0;
 										}
 										pending_request.response_transfer_size += ResourceAdvertisement::read_transfer_size(packet);
-										//p if pending_request.started_at == None:
 										if (pending_request.started_at == 0.0) {
 											pending_request.started_at = OS::time();
 										}
@@ -1173,7 +1036,6 @@ void Link::receive(const Packet& packet) {
 							}
 						}
 						else if (_object->_resource_strategy == ACCEPT_NONE) {
-							//p pass
 						}
 						else if (_object->_resource_strategy == ACCEPT_APP) {
 							if (_object->_callbacks.resource) {
@@ -1233,7 +1095,6 @@ void Link::receive(const Packet& packet) {
 				case Type::Packet::KEEPALIVE:
 				{
 					if (!_object->_initiator && packet.data() == "\xFF") {
-                        //p keepalive_packet = RNS.Packet(self, bytes([0xFE]), context=RNS.Packet.KEEPALIVE)
 						Packet keepalive_packet(*this, Bytes("\xFE"), Type::Packet::DATA, Type::Packet::KEEPALIVE);
 						keepalive_packet.send();
 						had_outbound(true);
@@ -1247,23 +1108,16 @@ void Link::receive(const Packet& packet) {
 				case Type::Packet::RESOURCE:
 				{
 					for (auto& resource : _object->_incoming_resources) {
-						//z resource.receive_part(packet);
 					}
 					break;
 				}
 /*z
 				case Type::Packet::CHANNEL:
 				{
-					//z if (!_object->_channel) {
 					if (true) {
 						DEBUG(f"Channel data received without open channel")
 					}
 					else {
-						//z packet.prove();
-						//z plaintext = decrypt(packet.data());
-						//z if (plaintext) {
-						//z 	_object->_channel._receive(plaintext);
-						//z }
 					}
 					break;
 				}
@@ -1275,7 +1129,6 @@ void Link::receive(const Packet& packet) {
 					Bytes resource_hash = packet.data().left(Type::Identity::HASHLENGTH/8);
 					for (const auto& resource : _object->_outgoing_resources) {
 						if (resource_hash == resource.hash()) {
-							//z resource.validate_proof(packet.data());
 						}
 					}
 				}
@@ -1609,14 +1462,11 @@ RequestReceipt::RequestReceipt(const Link& link, const PacketReceipt& packet_rec
 	_object->_resource = resource;
 	if (_object->_packet_receipt) {
 		_object->_hash = packet_receipt.truncated_hash();
-		//z _object->_packet_receipt.set_timeout_callback(request_timed_out);
 		_object->_started_at = OS::time();
 	}
 	else if (_object->_resource) {
 		_object->_hash = resource.request_id();
 		// CBA TODO Need to find cross-platform way of passing class method as callback
-		//z const_cast<Resource&>(resource).set_concluded_callback(request_resource_concluded);
-		//z const_cast<Resource&>(resource).set_concluded_callback(std::bind(&RequestReceipt::request_resource_concluded, this, std::placeholders::_1));
 	}
 	_object->_link = link;
 	_object->_request_id = _object->_hash;
@@ -1645,9 +1495,6 @@ void RequestReceipt::request_resource_concluded(const Resource& resource) {
 		}
 		_object->_status = Type::RequestReceipt::DELIVERED;
 		_object->_resource_response_timeout = OS::time() + _object->_timeout;
-		//p response_timeout_thread = threading.Thread(target=_object->___response_timeout_job)
-		//p response_timeout_thread.daemon = True
-		//p response_timeout_thread.start()
 	}
 	else {
 		DEBUGF("Sending request %s as resource failed with status: %d", _object->_request_id.toHex().c_str(), resource.status());

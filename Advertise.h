@@ -37,9 +37,9 @@
 #include "FirewallMode.h"
 
 #if defined(ESP32)
-#include <esp_task_wdt.h>
+    #include <esp_task_wdt.h>
+    #include <Preferences.h>
 #endif
-
 // Externally-defined LoRa parameters (see Config.h / RNode_Firmware.ino)
 extern uint32_t lora_freq;
 extern uint32_t lora_bw;
@@ -77,7 +77,7 @@ extern char     rtc_node_hash_hex[33];
 
 // Defaults — must match Reticulum's interface-announcer defaults so the
 // stamp validates against the on-network handler (RNS/Discovery.py).
-#define ADV_DEFAULT_STAMP_COST      14
+#define ADV_DEFAULT_STAMP_COST      14  // Must be >= 14 — both Python & Rust rnsd require this minimum
 #define ADV_WORKBLOCK_EXPAND_ROUNDS 20
 #define ADV_STAMP_SIZE              32 /* SHA-256 / HASHLENGTH/8 */
 
@@ -101,8 +101,40 @@ static uint32_t advertise_announce_interval_ms = ADV_DEFAULT_ANNOUNCE_INTERVAL_S
 
 // Cached stamp keyed by infohash so we only redo the proof-of-work when the
 // advertised parameters actually change (matches InterfaceAnnouncer.stamp_cache).
+// Stamp is persisted to ESP32 NVS to survive reboots.
 static RNS::Bytes advertise_cached_infohash;
 static RNS::Bytes advertise_cached_stamp;
+
+#if defined(ESP32)
+static const char* ADV_NVS_NS   = "rtnode";
+static const char* ADV_NVS_IH   = "adv_ih";   // infohash (32 bytes)
+static const char* ADV_NVS_STAMP = "adv_st";   // stamp (32 bytes)
+
+static void advertise_load_stamp() {
+    Preferences prefs;
+    if (!prefs.begin(ADV_NVS_NS, true)) return; // read-only
+    size_t ih_len = prefs.getBytesLength(ADV_NVS_IH);
+    size_t st_len = prefs.getBytesLength(ADV_NVS_STAMP);
+    if (ih_len == 32 && st_len == ADV_STAMP_SIZE) { // HASHLENGTH/8 = 32
+        uint8_t ih_buf[64], st_buf[32];
+        prefs.getBytes(ADV_NVS_IH, ih_buf, ih_len);
+        prefs.getBytes(ADV_NVS_STAMP, st_buf, st_len);
+        advertise_cached_infohash = RNS::Bytes(ih_buf, ih_len);
+        advertise_cached_stamp    = RNS::Bytes(st_buf, st_len);
+        RNS::verbose("[Advertise] Loaded cached stamp from NVS");
+    }
+    prefs.end();
+}
+
+static void advertise_save_stamp() {
+    Preferences prefs;
+    if (!prefs.begin(ADV_NVS_NS, false)) return;
+    prefs.putBytes(ADV_NVS_IH, advertise_cached_infohash.data(), advertise_cached_infohash.size());
+    prefs.putBytes(ADV_NVS_STAMP, advertise_cached_stamp.data(), advertise_cached_stamp.size());
+    prefs.end();
+    RNS::verbose("[Advertise] Saved stamp to NVS");
+}
+#endif
 
 // ─── MessagePack encoder ────────────────────────────────────────────────────
 // Minimal encoder covering the types required by the discovery info dict:
@@ -445,6 +477,9 @@ static void advertise_send_announce() {
         }
         advertise_cached_infohash = infohash;
         advertise_cached_stamp    = stamp;
+#if defined(ESP32)
+        advertise_save_stamp();
+#endif
     }
 
     // Assemble payload: bytes([flags]) || packed || stamp
@@ -482,6 +517,10 @@ inline void advertise_init() {
     advertise_first_announce = true;
     advertise_next_run_ms    = millis() + ADV_INITIAL_DELAY_MS;
     advertise_announce_interval_ms = ADV_DEFAULT_ANNOUNCE_INTERVAL_S * 1000UL;
+
+#if defined(ESP32)
+    advertise_load_stamp();
+#endif
 
     if (firewall_state.advert_enabled) {
         RNS::info("[Advertise] Device advertisement ENABLED — first announce in ~" +

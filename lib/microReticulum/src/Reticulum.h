@@ -27,18 +27,11 @@ namespace RNS {
 
 	public:
 
-		//z router           = None
-		//z config           = None
 
 		// The default configuration path will be expanded to a directory
 		// named ".reticulum" inside the current users home directory
-		//z userdir          = os.path.expanduser("~")
-		//z configdir        = None
-		//z configpath       = ""
-		//p storagepath      = ""
 		//static std::string _storagepath;
 		static char _storagepath[Type::Reticulum::FILEPATH_MAXSIZE];
-		//p cachepath        = ""
 		//static std::string _cachepath;
 		static char _cachepath[Type::Reticulum::FILEPATH_MAXSIZE];
 
@@ -168,14 +161,11 @@ namespace RNS {
 			uint16_t _local_interface_port = 37428;
 			uint16_t _local_control_port   = 37429;
 			bool _share_instance       = true;
-			//p _rpc_listener         = None
 
-			//p _ifac_salt = Reticulum.IFAC_SALT
 
 			bool _is_shared_instance = false;
 			bool _is_connected_to_shared_instance = false;
 			bool _is_standalone_instance = false;
-			//p _jobs_thread = None
 			double _last_data_persist = Utilities::OS::time();
 			double _last_cache_clean = 0.0;
 

@@ -72,12 +72,10 @@ bool Identity::load_private_key(const Bytes& prv_bytes) {
 
 	try {
 
-		//p self.prv_bytes     = prv_bytes[:Identity.KEYSIZE//8//2]
 		_object->_prv_bytes     = prv_bytes.left(Type::Identity::KEYSIZE/8/2);
 		_object->_prv           = X25519PrivateKey::from_private_bytes(_object->_prv_bytes);
 		//TRACE("Identity::load_private_key: prv bytes:     " + _object->_prv_bytes.toHex());
 
-		//p self.sig_prv_bytes = prv_bytes[Identity.KEYSIZE//8//2:]
 		_object->_sig_prv_bytes = prv_bytes.mid(Type::Identity::KEYSIZE/8/2);
 		_object->_sig_prv       = Ed25519PrivateKey::from_private_bytes(_object->_sig_prv_bytes);
 		//TRACE("Identity::load_private_key: sig prv bytes: " + _object->_sig_prv_bytes.toHex());
@@ -95,7 +93,6 @@ bool Identity::load_private_key(const Bytes& prv_bytes) {
 		return true;
 	}
 	catch (std::exception& e) {
-		//p raise e
 		ERROR("Failed to load identity key");
 		ERRORF("The contained exception was: %s", e.what());
 		return false;
@@ -194,7 +191,6 @@ Can be used to load previously created and saved identities into Reticulum.
 		throw std::invalid_argument("Can't remember " + destination_hash.toHex() + ", the public key size of " + std::to_string(public_key.size()) + " is not valid.");
 	}
 	else {
-		//p _known_destinations[destination_hash] = {OS::time(), packet_hash, public_key, app_data};
 		// CBA ACCUMULATES
 		_known_destinations.insert({destination_hash, {OS::time(), packet_hash, public_key, app_data}});
 	}
@@ -434,7 +430,6 @@ Recall last heard app_data for a destination hash.
 					}
 
 					remember(packet.get_hash(), packet.destination_hash(), public_key, app_data);
-					//p del announced_identity
 
 					std::string signal_str;
 // TODO
@@ -468,7 +463,6 @@ Recall last heard app_data for a destination hash.
 			}
 			else {
 				DEBUG("Received invalid announce for " + packet.destination_hash().toHex() + ": Invalid signature.");
-				//p del announced_identity
 				return false;
 			}
 		}
@@ -549,9 +543,7 @@ const Bytes Identity::decrypt(const Bytes& ciphertext_token) const {
 	}
 	Bytes plaintext;
 	try {
-		//peer_pub_bytes = ciphertext_token[:Identity.KEYSIZE//8//2]
 		Bytes peer_pub_bytes = ciphertext_token.left(Type::Identity::KEYSIZE/8/2);
-		//peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
 		//Cryptography::X25519PublicKey::Ptr peer_pub = Cryptography::X25519PublicKey::from_public_bytes(peer_pub_bytes);
 		TRACE("Identity::decrypt: peer public key:      " + peer_pub_bytes.toHex());
 

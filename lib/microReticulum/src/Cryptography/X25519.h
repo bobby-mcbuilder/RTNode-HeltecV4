@@ -60,7 +60,6 @@ namespace RNS { namespace Cryptography {
 		const float MAX_EXEC_TIME = 500;	// in milliseconds
 		const uint8_t DELAY_WINDOW = 10;
 
-		//z T_CLEAR = None
 		const uint8_t T_MAX = 0;
 
 		using Ptr = std::shared_ptr<X25519PrivateKey>;

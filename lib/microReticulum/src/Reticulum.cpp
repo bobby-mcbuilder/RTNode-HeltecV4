@@ -42,28 +42,6 @@ pass any traffic before being instantiated.
 :param configdir: Full path to a Reticulum configuration directory.
 */
 
-/*p TODO
-@staticmethod
-void Reticulum::exit_handler():
-	# This exit handler is called whenever Reticulum is asked to
-	# shut down, and will in turn call exit handlers in other
-	# classes, saving necessary information to disk and carrying
-	# out cleanup operations.
-
-	Transport::exit_handler()
-	RNS.Identity.exit_handler()
-
-@staticmethod
-void Reticulum::sigint_handler(signal, frame):
-	Transport::detach_interfaces()
-	RNS.exit()
-
-
-@staticmethod
-void Reticulum::sigterm_handler(signal, frame):
-	Transport::detach_interfaces()
-	RNS.exit()
-*/
 
 //def __init__(self,configdir=None, loglevel=None, logdest=None, verbosity=None):
 Reticulum::Reticulum() : _object(new Object()) {
@@ -79,29 +57,8 @@ Reticulum::Reticulum() : _object(new Object()) {
 	//RNG.addNoiseSource(noise);
  #endif
 
-	//z RNS.vendor.platformutils.platform_checks()
 
-/*p TODO
-	if configdir != None:
-		Reticulum.configdir = configdir
-	else:
-		if os.path.isdir("/etc/reticulum") and os.path.isfile("/etc/reticulum/config"):
-			Reticulum.configdir = "/etc/reticulum"
-		elif os.path.isdir(Reticulum.userdir+"/.config/reticulum") and os.path.isfile(Reticulum.userdir+"/.config/reticulum/config"):
-			Reticulum.configdir = Reticulum.userdir+"/.config/reticulum"
-		else:
-			Reticulum.configdir = Reticulum.userdir+"/.reticulum"
 
-	if logdest == RNS.LOG_FILE:
-		RNS.logdest = RNS.LOG_FILE
-		RNS.logfile = Reticulum.configdir+"/logfile"
-
-	Reticulum.configpath    = Reticulum.configdir+"/config"
-	Reticulum.storagepath   = Reticulum.configdir+"/storage"
-	Reticulum.cachepath     = Reticulum.configdir+"/storage/cache"
-	Reticulum.resourcepath  = Reticulum.configdir+"/storage/resources"
-	Reticulum.identitypath  = Reticulum.configdir+"/storage/identities"
-*/
 // CBA TEST
 #ifdef ARDUINO
 	//_storagepath = "";
@@ -141,55 +98,10 @@ Reticulum::Reticulum() : _object(new Object()) {
 	_object->_last_cache_clean = 0.0;
 	_object->_jobs_last_run = OS::time();
 
-/*p TODO
-	if not os.path.isdir(Reticulum.storagepath):
-		os.makedirs(Reticulum.storagepath)
-
-	if not os.path.isdir(Reticulum.cachepath):
-		os.makedirs(Reticulum.cachepath)
-
-	if not os.path.isdir(Reticulum.resourcepath):
-		os.makedirs(Reticulum.resourcepath)
-
-	if not os.path.isdir(Reticulum.identitypath):
-		os.makedirs(Reticulum.identitypath)
-
-	if os.path.isfile(self.configpath):
-		try:
-			self.config = ConfigObj(self.configpath)
-		except Exception as e:
-			RNS.log("Could not parse the configuration at "+self.configpath, RNS.LOG_ERROR)
-			RNS.log("Check your configuration file for errors!", RNS.LOG_ERROR)
-			RNS.panic()
-	else:
-		RNS.log("Could not load config file, creating default configuration file...")
-		self.__create_default_config()
-		RNS.log("Default config file created. Make any necessary changes in "+Reticulum.configdir+"/config and restart Reticulum if needed.")
-		time.sleep(1.5)
-
-	self.__apply_config()
-	RNS.log("Configuration loaded from "+self.configpath, RNS.LOG_VERBOSE)
-
-	RNS.Identity.load_known_destinations()
-*/
 
 	// CBA Moved to start() so Transport is not started  until after interfaces are setup
 	//Transport::start(*this);
 
-/*p TODO
-	self.rpc_addr = ("127.0.0.1", self.local_control_port)
-	self.rpc_key  = RNS.Identity.full_hash(Transport::identity.get_private_key())
-
-	if self.is_shared_instance:
-		self.rpc_listener = multiprocessing.connection.Listener(self.rpc_addr, authkey=self.rpc_key)
-		thread = threading.Thread(target=self.rpc_loop)
-		thread.daemon = True
-		thread.start()
-
-	atexit.register(Reticulum.exit_handler)
-	signal.signal(signal.SIGINT, Reticulum.sigint_handler)
-	signal.signal(signal.SIGTERM, Reticulum.sigterm_handler)
-*/
 
 	MEM("Reticulum default object created, this: " + std::to_string((uintptr_t)this) + ", data: " + std::to_string((uintptr_t)_object.get()));
 }
@@ -317,11 +229,6 @@ void Reticulum::clean_caches() {
 			if (filename.length() == (Type::Identity::HASHLENGTH//8)*2) {
 				char filepath[FILEPATH_MAXSIZE];
 				snprintf(filepath, FILEPATH_MAXSIZE, "%s/%s", _resourcepath, filename.c_str());
-				//p mtime = os.path.getmtime(filepath)
-				//p age = now - mtime
-				//p if (age > Types::Reticulum.RESOURCE_CACHE) {
-				//p 	OS::remove_file(filepath);
-				//p }
 			}
 		}
 		catch (std::exception& e) {
@@ -335,11 +242,6 @@ void Reticulum::clean_caches() {
 			if (filename.length() == (Type::Identity::HASHLENGTH/8)*2) {
 				char filepath[FILEPATH_MAXSIZE];
 				snprintf(filepath, FILEPATH_MAXSIZE, "%s/%s", _cachepath, filename.c_str());
-				//p mtime = os.path.getmtime(filepath)
-				//p age = now - mtime
-				//p if (age > Types::Transport::DESTINATION_TIMEOUT) {
-				//p 	OS::remove_file(filepath);
-				//p }
 			}
 		}
 		catch (std::exception& e) {
@@ -377,23 +279,6 @@ void Reticulum::clear_caches() {
 	}
 }
 
-/*p TODO
-
-void Reticulum::__create_default_config() {
-	self.config = ConfigObj(__default_rns_config__)
-	self.config.filename = Reticulum.configpath
-	
-	if not os.path.isdir(Reticulum.configdir):
-		os.makedirs(Reticulum.configdir)
-	self.config.write()
-}
-
-void Reticulum::rpc_loop() {
-}
-
-void Reticulum::get_interface_stats() const {
-}
-*/
 
 const std::map<Bytes, std::deque<Transport::PathEntry>>& Reticulum::get_path_table() const {
 /*
@@ -470,25 +355,4 @@ size_t Reticulum::get_link_count() const {
 	return Transport::get_link_table().size();
 }
 
-/*p
-void Reticulum::get_packet_rssi(const Bytes& packet_hash) const {
-	for entry in Transport::local_client_rssi_cache:
-		if entry[0] == packet_hash:
-			return entry[1]
 
-	return None
-
-void Reticulum::get_packet_snr(const Bytes& packet_hash) const {
-	for entry in Transport::local_client_snr_cache:
-		if entry[0] == packet_hash:
-			return entry[1]
-
-	return None
-
-void Reticulum::get_packet_q(const Bytes& packet_hash) const {
-	for entry in Transport::local_client_q_cache:
-		if entry[0] == packet_hash:
-			return entry[1]
-
-	return None
-*/

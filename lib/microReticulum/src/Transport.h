@@ -367,7 +367,7 @@ namespace RNS {
 		static void handle_tunnel(const Bytes& tunnel_id, const Interface& interface);
 		static void register_interface(Interface& interface);
 		static void deregister_interface(const Interface& interface);
-		static void register_local_client_interface(const Interface& interface) { _local_client_interfaces.insert(std::cref(interface)); }
+		static void register_local_client_interface(const Interface&) { /* no-op in firewall mode */ }
 		inline static const std::map<Bytes, Interface&> get_interfaces() { return _interfaces; }
 		static void register_destination(Destination& destination);
 		static void deregister_destination(const Destination& destination);
@@ -400,12 +400,7 @@ namespace RNS {
 		static void request_path(const Bytes& destination_hash);
 		static void path_request_handler(const Bytes& data, const Packet& packet);
 		static void path_request(const Bytes& destination_hash, bool is_from_local_client, const Interface& attached_interface, const Bytes& requestor_transport_id = {}, const Bytes& tag = {});
-		static bool from_local_client(const Packet& packet);
-		static bool is_local_client_interface(const Interface& interface);
-		static bool interface_to_shared_instance(const Interface& interface);
-		static void detach_interfaces();
-		static void shared_connection_disappeared();
-		static void shared_connection_reappeared();
+		static bool detach_interfaces();
 		static void drop_announce_queues();
 		static uint64_t announce_emitted(const Packet& packet);
 		static void write_packet_hashlist();
@@ -436,6 +431,11 @@ namespace RNS {
 		/// Select the best non-expired path for a destination by score = bitrate/(hops+1).
 		/// Returns nullptr if no valid path exists.
 		static const PathEntry* select_path(const Bytes& destination_hash);
+
+		/// Return all non-expired path entries for a destination, sorted by
+		/// score descending (best first).  Used by outbound hedging to walk
+		/// paths in quality order, stopping at the first fresh one.
+		static std::vector<PathEntry> select_all_paths(const Bytes& destination_hash);
 
 		// getters/setters
 		static inline void set_receive_packet_callback(Callbacks::receive_packet callback) { _callbacks._receive_packet = callback; }
@@ -506,8 +506,7 @@ namespace RNS {
 		// Interfaces for communicating with
 		// local clients connected to a shared
 		// Reticulum instance
-		//static std::set<Interface> _local_client_interfaces;
-		static std::set<std::reference_wrapper<const Interface>, std::less<const Interface>> _local_client_interfaces;
+
 
 		static std::map<Bytes, Bytes> _pending_local_path_requests;
 
@@ -515,9 +514,7 @@ namespace RNS {
 		static std::map<Bytes, PacketEntry> _packet_table;           // A lookup table containing announce packets for known paths
 		static std::set<Bytes> _known_cached_packet_hashes;          // Packet hashes confirmed cached in this boot
 
-		//z _local_client_rssi_cache    = []
-		//z _local_client_snr_cache     = []
-		static uint16_t _LOCAL_CLIENT_CACHE_MAXSIZE;
+
 
 		static double _start_time;
 		static bool _jobs_locked;

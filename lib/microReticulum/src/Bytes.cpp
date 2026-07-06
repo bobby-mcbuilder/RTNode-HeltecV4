@@ -91,14 +91,9 @@ int Bytes::compare(const Bytes& bytes) const {
 	else if (!bytes._data) {
 		return 1;
 	}
-	else if (*_data < *(bytes._data)) {
-		return -1;
-	}
-	else if (*_data > *(bytes._data)) {
-		return 1;
-	}
 	else {
-		return 0;
+		// Compare actual byte contents, not shared_ptr addresses
+		return compare(bytes._data->data(), bytes._data->size());
 	}
 }
 

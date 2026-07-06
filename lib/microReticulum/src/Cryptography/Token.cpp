@@ -21,16 +21,12 @@ Token::Token(const Bytes& key, token_mode mode /*= AES*/) {
 	if (mode == MODE_AES) {
 		if (key.size() == 32) {
 			_mode = MODE_AES_128_CBC;
-			//p self._signing_key = key[:16]
 			_signing_key = key.left(16);
-			//p self._encryption_key = key[16:]
 			_encryption_key = key.mid(16);
 		}
 		else if (key.size() == 64) {
 			_mode = MODE_AES_256_CBC;
-			//p self._signing_key = key[:32]
 			_signing_key = key.left(32);
-			//p self._encryption_key = key[32:]
 			_encryption_key = key.mid(32);
 		}
 		else {

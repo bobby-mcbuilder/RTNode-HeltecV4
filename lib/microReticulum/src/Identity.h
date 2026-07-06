@@ -133,7 +133,6 @@ namespace RNS {
 		:returns: Truncated SHA-256 hash as *bytes*
 		*/
 		static inline const Bytes truncated_hash(const Bytes& data) {
-			//p return Identity.full_hash(data)[:(Identity.TRUNCATED_HASHLENGTH//8)]
 			return full_hash(data).left(Type::Identity::TRUNCATED_HASHLENGTH/8);
 		}
 

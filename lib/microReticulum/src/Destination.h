@@ -24,7 +24,6 @@ namespace RNS {
 
 	class RequestHandler {
 	public:
-		//p response_generator(path, data, request_id, link_id, remote_identity, requested_at)
 		using response_generator = Bytes(*)(const Bytes& path, const Bytes& data, const Bytes& request_id, const Bytes& link_id, const Identity& remote_identity, double requested_at);
 	public:
 		RequestHandler(const RequestHandler& handler) {
@@ -236,8 +235,6 @@ namespace RNS {
 
 			// CBA TODO when is _default_app_data a "callable"?
 			Bytes _default_app_data;
-			//z _callback = None
-			//z _proofcallback = None
 
 			// CBA LINK
 			// CBA _link_id is expected by Packet but only present in Link

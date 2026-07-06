@@ -49,6 +49,10 @@ namespace RNS {
 
 		// CBA Virtual override method for custom interface to send outgoing data
 		virtual void send_outgoing(const Bytes& data) = 0;
+
+		// Whether this interface can currently deliver packets.
+		// Default true; TCP interfaces override to check client count.
+		virtual bool isConnected() const { return true; }
 		
 		// CBA Internal method to handle housekeeping for data going out on interface
 		void handle_outgoing(const Bytes& data);
@@ -208,6 +212,7 @@ namespace RNS {
 		inline bool is_local_shared_instance() const { assert(_impl); return _impl->_is_local_shared_instance; }
 		inline bool is_backbone() const { assert(_impl); return _impl->_is_backbone; }
 		inline void is_backbone(bool val) { assert(_impl); _impl->_is_backbone = val; }
+		inline bool isConnected() const { assert(_impl); return _impl->isConnected(); }
 		inline HInterface parent_interface() const { assert(_impl); return _impl->_parent_interface; }
 
 		virtual inline std::string toString() const { if (!_impl) return ""; return _impl->toString(); }

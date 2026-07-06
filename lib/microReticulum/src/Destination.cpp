@@ -48,7 +48,6 @@ Destination::Destination(const Identity& identity, const directions direction, c
 	_object->_hexhash = _object->_hash.toHex();
 	TRACE("Destination::Destination: hash: " + _object->_hash.toHex());
 	//TRACE("Destination::Destination: creating name hash...");
-    //p self.name_hash = RNS.Identity.full_hash(self.expand_name(None, app_name, *aspects).encode("utf-8"))[:(RNS.Identity.NAME_HASH_LENGTH//8)]
 	_object->_name_hash = name_hash(app_name, aspects);
 	//TRACE("Destination::Destination: name hash: " + _object->_name_hash.toHex());
 
@@ -73,7 +72,6 @@ Destination::Destination(const Identity& identity, const Type::Destination::dire
 	_object->_hexhash = _object->_hash.toHex();
 	TRACE("Destination::Destination: hash: " + _object->_hash.toHex());
 	//TRACE("Destination::Destination: creating name hash...");
-    //p self.name_hash = RNS.Identity.full_hash(self.expand_name(None, app_name, *aspects).encode("utf-8"))[:(RNS.Identity.NAME_HASH_LENGTH//8)]
 	_object->_name_hash = name_hash("unknown", "unknown");
 	//TRACE("Destination::Destination: name hash: " + _object->_name_hash.toHex());
 
@@ -99,14 +97,11 @@ Destination::Destination(const Identity& identity, const Type::Destination::dire
 :returns: A destination name in adressable hash form, for an app_name and a number of aspects.
 */
 /*static*/ Bytes Destination::hash(const Identity& identity, const char* app_name, const char* aspects) {
-	//p name_hash = Identity::full_hash(Destination.expand_name(None, app_name, *aspects).encode("utf-8"))[:(RNS.Identity.NAME_HASH_LENGTH//8)]
-	//p addr_hash_material = name_hash
 	Bytes addr_hash_material = name_hash(app_name, aspects);
 	if (identity) {
 		addr_hash_material << identity.hash();
 	}
 
-    //p return RNS.Identity.full_hash(addr_hash_material)[:RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
 	// CBA TODO valid alternative?
 	//return Identity::full_hash(addr_hash_material).left(Type::Reticulum::TRUNCATED_HASHLENGTH/8);
 	return Identity::truncated_hash(addr_hash_material);
@@ -116,7 +111,6 @@ Destination::Destination(const Identity& identity, const Type::Destination::dire
 :returns: A name in hash form, for an app_name and a number of aspects.
 */
 /*static*/ Bytes Destination::name_hash(const char* app_name, const char* aspects) {
-	//p name_hash = Identity::full_hash(Destination.expand_name(None, app_name, *aspects).encode("utf-8"))[:(RNS.Identity.NAME_HASH_LENGTH//8)]
 	return Identity::full_hash(expand_name({Type::NONE}, app_name, aspects)).left(Type::Identity::NAME_HASH_LENGTH/8);
 }
 
@@ -124,8 +118,6 @@ Destination::Destination(const Identity& identity, const Type::Destination::dire
 :returns: A tuple containing the app name and a list of aspects, for a full-name string.
 */
 /*static*/ std::vector<std::string> Destination::app_and_aspects_from_name(const char* full_name) {
-	//p components = full_name.split(".")
-	//p return (components[0], components[1:])
 	std::vector<std::string> components;
 	std::string name(full_name);
 	std::size_t pos = name.find('.');
@@ -140,8 +132,6 @@ Destination::Destination(const Identity& identity, const Type::Destination::dire
 :returns: A destination name in adressable hash form, for a full name string and Identity instance.
 */
 /*static*/ Bytes Destination::hash_from_name_and_identity(const char* full_name, const Identity& identity) {
-	//p app_name, aspects = Destination.app_and_aspects_from_name(full_name)
-	//p return Destination.hash(identity, app_name, *aspects)
 	std::vector<std::string> components = app_and_aspects_from_name(full_name);
 	if (components.size() == 0) {
 		return {Bytes::NONE};
@@ -247,7 +237,6 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 		// received via multiple paths. The difference in reception time will
 		// potentially also be useful in determining characteristics of the
 		// multiple available paths, and to choose the best one.
-		//z TRACE("Using cached announce data for answering path request with tag "+RNS.prettyhexrep(tag));
 		announce_data << _object->_path_responses[tag].second;
 	}
 	else {
@@ -296,7 +285,6 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 	}
 
 	//TRACE("Destination::announce: creating announce packet...");
-    //p announce_packet = RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE, context = announce_context, attached_interface = attached_interface)
 	//Packet announce_packet(*this, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1, nullptr, attached_interface);
 	Packet announce_packet(*this, attached_interface, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1);
 

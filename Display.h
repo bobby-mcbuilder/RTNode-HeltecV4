@@ -940,7 +940,7 @@ void draw_disp_area() {
       // Radio info
       disp_area.setCursor(3, 16);
       if (radio_online) {
-        disp_area.printf("%.3f MHz", (float)lora_freq / 1000000.0);
+        disp_area.printf("%.3f MHz", (double)lora_freq / 1000000.0);
       } else {
         disp_area.print("Radio OFF");
       }

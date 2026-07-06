@@ -32,14 +32,12 @@ namespace RNS { namespace Cryptography {
 			size_t padlen = bs - (len % bs);
 			//DEBUG("PKCS7::pad: pad len: " + std::to_string(padlen));
 			// create zero-filled byte padding array of size padlen
-			//p v = bytes([padlen])
 			//uint8_t pad[padlen] = {0};
 			uint8_t pad[padlen];
 			memset(pad, 0, padlen);
 			// set last byte of padding array to size of padding
 			pad[padlen-1] = (uint8_t)padlen;
 			// concatenate data with padding
-			//p return data+v*padlen
 			data.append(pad, padlen);
 			//DEBUG("PKCS7::pad: data size: " + std::to_string(data.size()));
 		}
@@ -49,7 +47,6 @@ namespace RNS { namespace Cryptography {
 			size_t len = data.size();
 			//DEBUG("PKCS7::unpad: len: " + std::to_string(len));
 			// read last byte which is pad length
-			//pad = data[-1]
 			size_t padlen = (size_t)data.data()[data.size()-1];
 			//DEBUG("PKCS7::unpad: pad len: " + std::to_string(padlen));
 			if (padlen > bs) {

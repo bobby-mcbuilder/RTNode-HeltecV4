@@ -220,7 +220,6 @@ namespace ArduinoJson {
 			RNS::Bytes raw = src["raw"];
 			//RNS::Bytes raw = src["raw"].as<const RNS::Bytes&>();
 			RNS::Packet packet(RNS::Destination(RNS::Type::NONE), raw);
-			//packet.set_hash(src["hash"]);
 			packet.sent_at(src["sent_at"]);
 			RNS::Bytes destination_hash = src["destination_hash"];
 			// set cached flag since pcket was read from cache

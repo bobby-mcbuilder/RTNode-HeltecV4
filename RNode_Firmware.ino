@@ -58,6 +58,24 @@ SPIClass SDSPI(HSPI);
   #include <esp_heap_caps.h>
 #endif
 
+// ── Forward declarations ──────────────────────────────────────────
+// The Arduino preprocessor normally generates these from the .ino,
+// but PlatformIO 6.1.18's preprocessor occasionally fails to emit
+// prototypes for functions defined later in the file.  Explicit
+// declarations here ensure the sketch compiles regardless of
+// toolchain version.
+void serial_interrupt_init();
+void serial_poll();
+void buffer_serial();
+bool medium_free();
+void update_radio_lock();
+void update_airtime();
+void update_modem_status();
+void validate_status();
+void transmit(uint16_t size);
+void flush_queue();
+void pop_queue();
+
 // WDT timeout
 #define WDT_TIMEOUT 60  // seconds
 

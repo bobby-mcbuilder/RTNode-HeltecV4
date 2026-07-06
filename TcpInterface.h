@@ -34,8 +34,9 @@
 #define TCP_IF_CONNECT_TIMEOUT   6000    // ms
 #define TCP_IF_WRITE_TIMEOUT     2000    // ms — short to avoid WDT
 #define TCP_IF_READ_TIMEOUT      120000  // ms — 2 minutes (backbone can go quiet)
-#define TCP_IF_RECONNECT_MIN     10000   // ms — initial reconnect interval
-#define TCP_IF_RECONNECT_MAX     120000  // ms — max backoff (2 minutes)
+#define TCP_IF_RECONNECT_MIN     30000   // ms — initial reconnect interval (30s, was 10s)
+#define TCP_IF_RECONNECT_MAX     600000  // ms — max backoff (10 minutes, was 2 min)
+#define TCP_IF_RECONNECT_GIVEUP  12      // consecutive failures before giving up entirely
 #define TCP_IF_KEEPALIVE_INTERVAL 30000  // ms — send empty HDLC frames to keep link alive
 #define TCP_IF_POLL_INTERVAL     10      // ms
 
@@ -172,6 +173,8 @@ public:
 
         // Client mode reconnection (with WiFi check + exponential backoff)
         if (_mode == TCP_IF_MODE_CLIENT && _num_clients == 0) {
+            // _reconnect_interval > TCP_IF_RECONNECT_MAX means we've given up
+            if (_reconnect_interval > TCP_IF_RECONNECT_MAX) return;
             uint32_t now = millis();
             if (now - _last_reconnect >= _reconnect_interval) {
                 if (WiFi.status() == WL_CONNECTED) {
@@ -239,8 +242,13 @@ protected:
     virtual void send_outgoing(const RNS::Bytes& data) override {
         if (!_started || _num_clients == 0) return;
 
-        // HDLC frame the data
-        uint8_t frame_buf[TCP_IF_HW_MTU * 2 + 4]; // worst case: every byte escaped + 2 flags
+        // HDLC frame the data.  Use a static buffer (BSS, not stack) to avoid
+        // "Stack canary watchpoint" crashes in deep call chains.  The frame can
+        // be up to 2x the input size (every byte escaped) + 2 FLAG delimiters.
+        // Single-threaded context (loopTask) so static is safe across all
+        // TcpInterface instances.
+        const size_t frame_cap = TCP_IF_HW_MTU * 2 + 4;
+        static uint8_t frame_buf[frame_cap];
         uint16_t flen = 0;
 
         frame_buf[flen++] = HDLC_FLAG;
@@ -252,7 +260,7 @@ protected:
             } else {
                 frame_buf[flen++] = b;
             }
-            if (flen >= sizeof(frame_buf) - 4) break; // safety
+            if (flen >= frame_cap - 4) break; // safety — truncate rather than overflow
         }
         frame_buf[flen++] = HDLC_FLAG;
 
@@ -268,8 +276,6 @@ protected:
                 size_t written = _clients[i].client.write(frame_buf, flen);
                 if (written == 0) {
                     _cleanup_client(i, "write failed");
-                } else if (written < flen) {
-                    Serial.printf("[TcpIF] PARTIAL write to client %d: %u/%u bytes\r\n", i, (unsigned)written, (unsigned)flen);
                 }
             }
         }
@@ -473,7 +479,14 @@ private:
                           _target_host, _target_port);
         } else {
             _consecutive_failures++;
-            // Exponential backoff: 10s -> 20s -> 40s -> 80s -> 120s (max)
+            if (_consecutive_failures >= TCP_IF_RECONNECT_GIVEUP) {
+                Serial.printf("[TcpIF] Giving up on %s:%d after %d failures\r\n",
+                              _target_host, _target_port, _consecutive_failures);
+                _reconnect_interval = TCP_IF_RECONNECT_MAX + 1; // signal: don't retry
+                _last_reconnect = millis();
+                return;
+            }
+            // Exponential backoff: 30s -> 60s -> 120s -> 240s -> 480s -> 600s (max)
             _reconnect_interval = _reconnect_interval * 2;
             if (_reconnect_interval > TCP_IF_RECONNECT_MAX) {
                 _reconnect_interval = TCP_IF_RECONNECT_MAX;

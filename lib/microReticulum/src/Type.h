@@ -99,7 +99,6 @@ namespace RNS { namespace Type {
 		static const uint16_t HEADER_MINSIZE   = 2+1+(TRUNCATED_HASHLENGTH/8)*1;	// In bytes
 		static const uint16_t HEADER_MAXSIZE   = 2+1+(TRUNCATED_HASHLENGTH/8)*2;	// In bytes
 		static const uint16_t IFAC_MIN_SIZE    = 1;
-		//z IFAC_SALT        = bytes.fromhex("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
 
 		static const uint16_t MDU              = MTU - HEADER_MAXSIZE - IFAC_MIN_SIZE;
 
@@ -423,6 +422,11 @@ namespace RNS { namespace Type {
 		static constexpr const float PATH_REQUEST_GRACE     = 0.35;         // Grace time before a path announcement is made, allows directly reachable peers to respond first
 		static const uint8_t PATH_REQUEST_RW      = 2;            // Path request random window
 		static const uint8_t PATH_REQUEST_MI      = 5;            // Minimum interval in seconds for automated path requests
+
+		/// Max age of a path entry's announce timestamp before the path is
+		/// considered stale and a hedge-duplicate is sent on an alternative
+		/// path.  Multi-hop transport only (hops >= 2).
+		static const uint16_t PATH_STALE_THRESHOLD = Link::STALE_TIME / 10;  // 72 s
 
 		static constexpr const float LINK_TIMEOUT  = Link::STALE_TIME * 1.25;
 		static const uint16_t REVERSE_TIMEOUT      = 30*60;        // Reverse table entries are removed after 30 minutes

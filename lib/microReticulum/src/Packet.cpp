@@ -305,7 +305,6 @@ void Packet::pack() {
 				_object->_ciphertext = _object->_data;
 			}
 			// CBA LINK
-            //p elif self.packet_type == Packet.PROOF and self.destination.type == RNS.Destination.LINK:
 			else if (_object->_packet_type == PROOF && _object->_destination.type() == Type::Destination::LINK) {
 				// Packet proofs over links are not encrypted
 				_object->_ciphertext = _object->_data;
@@ -337,10 +336,7 @@ TRACEF("***** Link data: %s", _object->_ciphertext.toHex().c_str());
 TRACEF("***** Destination Data: %s", _object->_ciphertext.toHex().c_str());
 				}
 				// CBA RATCHET
-				/*p TODO
-				if hasattr(self.destination, "latest_ratchet_id"):
-					self.ratchet_id = self.destination.latest_ratchet_id
-				*/
+				
 				_object->_encrypted = true;
 			}
 		}
@@ -439,7 +435,6 @@ PacketReceipt Packet::send() {
         throw std::logic_error("Packet was already sent");
 	}
 	// CBA LINK
-    //p if self.destination.type == RNS.Destination.LINK:
 	if (_object->_destination.type() == Type::Destination::LINK) {
 		if (!_object->_destination_link) throw std::invalid_argument("Packet is not associated with a Link");
 		if (_object->_destination_link.status() == Type::Link::CLOSED) {
@@ -458,14 +453,12 @@ PacketReceipt Packet::send() {
 
 	if (Transport::outbound(*this)) {
 		TRACE("Packet::send: successfully sent packet!!!");
-		//p return self.receipt
 		return _object->_receipt;
 	}
 	else {
 		ERROR("No interfaces could process the outbound packet");
 		_object->_sent = false;
 		_object->_receipt = {Type::NONE};
-		//p return False
 		return {Type::NONE};
 	}
 }
@@ -487,14 +480,12 @@ bool Packet::resend() {
 
 	if (Transport::outbound(*this)) {
 		TRACE("Packet::resend: successfully sent packet!!!");
-		//z return self.receipt
 		// MOCK
 		return true;
 	}
 	else {
 		ERROR("No interfaces could process the outbound packet");
 		_object->_sent = false;
-		//z self.receipt = None;
 		return false;
 	}
 }
@@ -504,13 +495,11 @@ void Packet::prove(const Destination& destination /*= {Type::NONE}*/) {
 	TRACE("Packet::prove: proving packet...");
 	// CBA LINK
 	// CBA TODO: Determine under which circumstances to use _destination and which to use _link since it's unclear from this logic
-    //p if self.fromPacked and hasattr(self, "destination") and self.destination:
 	if (_object->_fromPacked && _object->_destination) {
 		if (_object->_destination.identity() && _object->_destination.identity().prv()) {
 			_object->_destination.identity().prove(*this, destination);
 		}
 	}
-    //p elif self.fromPacked and hasattr(self, "link") and self.link:
 	else if (_object->_fromPacked && _object->_link) {
 		_object->_link.prove_packet(*this);
 	}
@@ -566,11 +555,9 @@ const Bytes Packet::get_hashable_part() const {
 	Bytes hashable_part;
 	hashable_part << (uint8_t)(_object->_raw.data()[0] & 0b00001111);
 	if (_object->_header_type == HEADER_2) {
-		//p hashable_part += self.raw[(RNS.Identity.TRUNCATED_HASHLENGTH//8)+2:]
 		hashable_part << _object->_raw.mid((Type::Identity::TRUNCATED_HASHLENGTH/8)+2);
 	}
 	else {
-		//p hashable_part += self.raw[2:];
 		hashable_part << _object->_raw.mid(2);
 	}
 	return hashable_part;
@@ -804,12 +791,9 @@ PacketReceipt::PacketReceipt(const Packet& packet) : _object(new Object()) {
 	// CBA LINK
 	if (packet.destination().type() == Type::Destination::LINK) {
 		if (!packet.destination_link()) throw std::invalid_argument("Packet is not associated with a Link");
-        //p self.timeout    = max(packet.destination.rtt * packet.destination.traffic_timeout_factor, RNS.Link.TRAFFIC_TIMEOUT_MIN_MS/1000)
 		_object->_timeout    = std::max(packet.destination_link().rtt() * packet.destination_link().traffic_timeout_factor(), (double)RNS::Type::Link::TRAFFIC_TIMEOUT_MIN_MS/1000);
 	}
 	else {
-		//p self.timeout    = RNS.Reticulum.get_instance().get_first_hop_timeout(self.destination.hash)
-		//p self.timeout   += Packet.TIMEOUT_PER_HOP * RNS.Transport.hops_to(self.destination.hash)
 		_object->_timeout    = RNS::Reticulum::get_instance().get_first_hop_timeout(_object->_destination.hash());
 		_object->_timeout   += TIMEOUT_PER_HOP * Transport::hops_to(_object->_destination.hash());
 	}
@@ -839,13 +823,10 @@ bool PacketReceipt::validate_link_proof(const Bytes& proof, const Link& link, co
 		Bytes proof_hash = proof.left(Type::Identity::HASHLENGTH/8);
 		Bytes signature = proof.mid(Type::Identity::HASHLENGTH/8, Type::Identity::SIGLENGTH/8);
 		if (proof_hash == _object->_hash) {
-			//z if (link.validate(signature, _object->_hash)) {
 			if (false) {
 				_object->_status = DELIVERED;
 				_object->_proved = true;
 				_object->_concluded_at = OS::time();
-				//z _object->_proof_packet = proof_packet;
-				//z link.last_proof(_object->_concluded_at);
 
 				if (_object->_callbacks._delivery) {
 					try {
@@ -907,7 +888,6 @@ bool PacketReceipt::validate_proof(const Bytes& proof, const Packet& proof_packe
 				_object->_status = DELIVERED;
 				_object->_proved = true;
 				_object->_concluded_at = OS::time();
-				//z _object->_proof_packet = proof_packet;
 
 				if (_object->_callbacks._delivery) {
 					try {
@@ -938,7 +918,6 @@ bool PacketReceipt::validate_proof(const Bytes& proof, const Packet& proof_packe
 			_object->_status = DELIVERED;
 			_object->_proved = true;
 			_object->_concluded_at = OS::time();
-			//z _object->_proof_packet = proof_packet;
 
 			if (_object->_callbacks._delivery) {
 				try {
@@ -973,9 +952,6 @@ void PacketReceipt::check_timeout() {
 		_object->_concluded_at = Utilities::OS::time();
 
 		if (_object->_callbacks._timeout) {
-			//z thread = threading.Thread(target=self.callbacks.timeout, args=(self,))
-			//z thread.daemon = True
-			//z thread.start();
 		}
 	}
 }

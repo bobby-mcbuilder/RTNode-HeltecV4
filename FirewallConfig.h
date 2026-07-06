@@ -780,10 +780,27 @@ static void config_handle_save() {
     firewall_save_config();
 
     // ── LoRa radio settings ──
+    // Parse frequency as integer Hz from a MHz decimal string (e.g. "869.4625"
+    // or "869,4625" → 869462500) without floating-point loss.
     String freq_str = config_server->arg("freq");
-    double freq_mhz = freq_str.toDouble();
-    if (freq_mhz > 0) {
-        lora_freq = (uint32_t)(freq_mhz * 1000000.0);
+    if (freq_str.length() > 0) {
+        // Accept both '.' and ',' as decimal separator (locale-independent)
+        freq_str.replace(',', '.');
+        uint32_t freq_hz = 0;
+        int dot = freq_str.indexOf('.');
+        if (dot >= 0) {
+            // MHz integer part
+            freq_hz = (uint32_t)freq_str.substring(0, dot).toInt() * 1000000UL;
+            // Fractional part: pad/truncate to exactly 6 digits (Hz resolution)
+            String frac = freq_str.substring(dot + 1);
+            while (frac.length() < 6) frac += '0';
+            if (frac.length() > 6) frac = frac.substring(0, 6);
+            freq_hz += (uint32_t)frac.toInt();
+        } else {
+            // No decimal point — treat as integer Hz
+            freq_hz = (uint32_t)freq_str.toInt();
+        }
+        if (freq_hz > 0) lora_freq = freq_hz;
     }
 
     String bw_str = config_server->arg("bw");
