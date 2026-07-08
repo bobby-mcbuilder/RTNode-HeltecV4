@@ -1149,6 +1149,25 @@ void setup() {
       } else if (firewall_state.wifi_enabled) {
         HEAD("Firewall Mode: Waiting for WiFi before starting TCP interfaces", RNS::LOG_WARNING);
       }
+
+      // ── Startup LAN probe ──────────────────────────────────────────────
+      // Send a path request for our own transport identity on LoRa to trigger
+      // local devices to announce themselves. This seeds the path table and
+      // Whitelist 1 so the boundary knows about local devices immediately,
+      // rather than waiting for them to transmit on their own schedule.
+      {
+        RNS::Identity transport_id = RNS::Transport::identity();
+        if (transport_id) {
+          HEAD("Sending startup path request on LAN interfaces to discover local devices...", RNS::LOG_NOTICE);
+          // Send on the LoRa interface only (not backbone)
+          RNS::Interface lora_iface = RNS::Transport::find_interface_from_hash(
+              RNS::Identity::full_hash({"Interface[LoRaInterface]"}));
+          if (lora_iface) {
+            RNS::Transport::request_path(transport_id.hash(), lora_iface);
+            HEAD("Startup LAN probe sent on LoRaInterface", RNS::LOG_NOTICE);
+          }
+        }
+      }
 #endif
 
       // CBA load/create local destination for admin node
@@ -2707,6 +2726,12 @@ void work_while_waiting() { loop(); }
 
 void loop() {
 
+#if MCU_VARIANT == MCU_ESP32
+  // Yield to FreeRTOS scheduler to prevent task WDT timeouts
+  // during long-running packet processing loops
+  yield();
+#endif
+
 #ifdef HAS_RNS
   // CBA
   if (reticulum) {
@@ -2790,6 +2815,18 @@ void loop() {
       Serial.printf("[WATCHDOG] Heap recovered: %u > %u — restored steady-state caps\r\n",
                     free_heap, HEAP_RECOVERY);
       _heap_pressure_stage = BOUNDARY_HEAP_STAGE_NONE;
+    }
+
+    // ── Periodic report (every 30s) ───────────────────────────────────────
+    {
+      static uint32_t _last_periodic_report = 0;
+      if (millis() - _last_periodic_report >= 30000) {
+        _last_periodic_report = millis();
+        uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        Serial.printf("[HEAP] free=%u min=%u max_alloc=%u psram=%u\r\n",
+                      free_heap, ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(), psram_free);
+        // RNS::Transport::dump_whitelists();
+      }
     }
 
     bool wifi_now = wifi_is_connected();

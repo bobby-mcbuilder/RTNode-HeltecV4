@@ -155,6 +155,24 @@ static std::vector<Bytes> _firewall_local_addresses;
 static std::vector<Bytes> _firewall_mentioned_addresses;
 static const uint16_t _firewall_maxsize = 200;
 
+// ── Whitelist helpers: enforce uniqueness on push (no per-node alloc) ──
+static void wl1_push(const Bytes& addr) {
+	if (!addr) return;
+	if (std::find(_firewall_local_addresses.begin(), _firewall_local_addresses.end(), addr)
+	    == _firewall_local_addresses.end()) {
+		_firewall_local_addresses.push_back(addr);
+	}
+}
+static bool wl2_push(const Bytes& addr) {
+	if (!addr) return false;
+	if (std::find(_firewall_mentioned_addresses.begin(), _firewall_mentioned_addresses.end(), addr)
+	    == _firewall_mentioned_addresses.end()) {
+		_firewall_mentioned_addresses.push_back(addr);
+		return true;
+	}
+	return false;
+}
+
 // ── Watched-destination logging ────────────────────────────────────────
 // Define WATCH_LOG to only log packets touching specific named destinations.
 // Comment out to restore full logging.
@@ -203,9 +221,27 @@ static const char* watch_match(const Packet& packet) {
 	if (packet.transport_id() && (n = watch_resolve(packet.transport_id()))) return n;
 	return nullptr;
 }
+// Helper: human-readable zone tag
+static inline const char* zone_tag(bool is_backbone) {
+	return is_backbone ? "WAN" : "LAN";
+}
+// Helper: short hash for logging
+static std::string short_hash(const Bytes& h) {
+	if (!h) return "none";
+	return h.toHex().substr(0,8);
+}
 #define WLOG(pkt, msg) do { \
 	const char* _wn = watch_match(pkt); \
-	if (_wn) { Serial.print("["); Serial.print(_wn); Serial.print("] "); Serial.println(std::string(msg).c_str()); } \
+	if (_wn) { \
+		Interface _rif = pkt.receiving_interface(); \
+		bool _from_bb = _rif && is_backbone_interface(_rif); \
+		Serial.print("["); Serial.print(_wn); Serial.print("] "); \
+		Serial.printf("[%s] - FROM: %s (%s) - %s\n", \
+			pkt_type_name(pkt.packet_type()), \
+			_rif ? _rif.toString().c_str() : "?", \
+			zone_tag(_from_bb), \
+			std::string(msg).c_str()); \
+	} \
 } while(0)
 #else
 #define WLOG(fmt, ...) do {} while(0)
@@ -253,7 +289,9 @@ static const char* pkt_type_name(uint8_t t) {
 	// ensure required directories exist
 	if (!OS::directory_exists(Reticulum::_cachepath)) {
 		VERBOSE("No cache directory, creating...");
-		OS::create_directory(Reticulum::_cachepath);
+		if (!OS::create_directory(Reticulum::_cachepath)) {
+			HEAD("Failed to create cache directory — packet cache will be unavailable", RNS::LOG_CRITICAL);
+		}
 	}
 
 	if (!_identity) {
@@ -992,7 +1030,7 @@ static const char* pkt_type_name(uint8_t t) {
 		}
 		// ── No path succeeded ─────────────────────────────────
 		if (!sent) {
-			WLOG(packet, "NO-PATH: " + std::string(pkt_type_name(packet.packet_type())) + " dest=" + packet.destination_hash().toHex().substr(0,8) + " hops=" + std::to_string(packet.hops()) + " — all known paths failed, packet dropped");
+			WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (?) - NO-PATH hops=" + std::to_string(packet.hops()) + " — all paths failed, dropped");
 		}
 	}
 	// If we don't have a known path for the destination, we'll
@@ -1494,6 +1532,29 @@ static const char* pkt_type_name(uint8_t t) {
 	packet.receiving_interface(interface);
 	packet.hops(packet.hops() + 1);
 
+	// Helper: determine destination zone from path table / local dests
+	auto dest_zone = [&](const Bytes& hash) -> const char* {
+		if (!hash) return "?";
+		// Check local registered destinations
+#if defined(DESTINATIONS_MAP)
+		if (_destinations.find(hash) != _destinations.end()) return "LAN";
+#elif defined(DESTINATIONS_SET)
+		for (auto& d : _destinations) { if (d.hash() == hash) return "LAN"; }
+#endif
+		// Check control hashes
+		if (_control_hashes.find(hash) != _control_hashes.end()) return "CTL";
+		// Check path table
+		if (has_path(hash)) {
+			const PathEntry* entry = select_path(hash);
+			if (entry) {
+				Interface iface = find_interface_from_hash(entry->receiving_interface);
+				if (iface && iface.is_backbone()) return "WAN";
+				return "LAN";
+			}
+		}
+		return "?";
+	};
+
 // TODO
 
 
@@ -1544,12 +1605,9 @@ static const char* pkt_type_name(uint8_t t) {
 			//     they represent relay nodes, not user traffic.
 			auto wl_add = [&](const Bytes& addr, const char* tag) {
 				if (!addr) return;
-				// Never whitelist control destination hashes — they
-				// are infrastructure addresses, not user traffic.
 				if (_control_hashes.find(addr) != _control_hashes.end()) return;
-				if (std::find(_firewall_mentioned_addresses.begin(), _firewall_mentioned_addresses.end(), addr) == _firewall_mentioned_addresses.end()) {
-					_firewall_mentioned_addresses.push_back(addr);
-					DEBUG(std::string(" WL-ADD ") + tag + "=" + addr.toHex().substr(0,8));
+				if (wl2_push(addr)) {
+					NOTICE("WL#2 ADD - " + addr.toHex().substr(0,8) + " (from " + zone_tag(strcmp(tag,"backbone")==0) + ")");
 				}
 			};
 			auto wl_known = [&](const Bytes& addr) -> bool {
@@ -1625,17 +1683,18 @@ static const char* pkt_type_name(uint8_t t) {
 				// table handles routing, and forged proofs fail signature
 				// validation downstream.
 				if (packet.packet_type() == Type::Packet::PROOF) {
-					WLOG(packet, "WL-PASS WAN PROOF (exempt) hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
+					WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - WL-PASS PROOF exempt hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
 					// Fall through to reverse-table routing below
 				}
 				// Only allowed if at least one address in the packet is
 				// already whitelisted (WL#1 or WL#2). No other gates.
 				else if (!any_known) {
+					WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - WL-BLOCK hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
 					return;
 				}
 				// Transitive: add all addresses to WL#2
 				for (auto& a : addrs) { wl_add(a, "backbone"); }
-				WLOG(packet, "WL-PASS WAN " + std::string(pkt_type_name(packet.packet_type())) + " hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
+				WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - WL-PASS hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
 			}
 			else {
 				// === LOCAL DEVICE PACKET ===
@@ -1643,7 +1702,7 @@ static const char* pkt_type_name(uint8_t t) {
 				// Local devices are trusted; their traffic seeds the
 				// secondary whitelist for return traffic from WAN.
 				for (auto& a : addrs) { wl_add(a, "local"); }
-				WLOG(packet, "WL-PASS LAN " + std::string(pkt_type_name(packet.packet_type())) + " hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
+				WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - WL-PASS hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
 			}
 		}
 #endif
@@ -1688,7 +1747,7 @@ static const char* pkt_type_name(uint8_t t) {
 #ifdef FIREWALL_MODE
 		// Log ALL non-announce packets arriving from local (non-backbone) interfaces
 		if (!is_backbone_interface(packet.receiving_interface()) && packet.packet_type() != Type::Packet::ANNOUNCE) {
-			WLOG(packet, "LOCAL-IN " + std::string(pkt_type_name(packet.packet_type())) + " hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
+			WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LAN-IN hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
 		}
 #endif
 		
@@ -1863,12 +1922,10 @@ static const char* pkt_type_name(uint8_t t) {
 							// CBA ACCUMULATES
 							Bytes th = packet.getTruncatedHash();
 							flatmap_erase(_reverse_table, th); _reverse_table.push_back({th, reverse_entry});
-							if (std::find(_firewall_mentioned_addresses.begin(), _firewall_mentioned_addresses.end(), th) == _firewall_mentioned_addresses.end()) {
-								_firewall_mentioned_addresses.push_back(th);
-							}
+							wl2_push(th);
 						}
 						TRACE("Transport::outbound: Sending packet to next hop...");
-						WLOG(packet, "FWD-TRANSPORT: " + std::string(pkt_type_name(packet.packet_type())) + " dest=" + packet.destination_hash().toHex().substr(0,8) + " hops=" + std::to_string(remaining_hops) + " via " + outbound_interface.toString());
+						WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - FWD: " + outbound_interface.toString() + " (" + zone_tag(is_backbone_interface(outbound_interface)) + ") transport hops=" + std::to_string(remaining_hops));
 #if defined(INTERFACES_SET)
 						transmit(const_cast<Interface&>(outbound_interface), new_raw);
 #else
@@ -1896,7 +1953,7 @@ static const char* pkt_type_name(uint8_t t) {
 						{
 							bool from_backbone = is_backbone_interface(packet.receiving_interface());
 							if (!from_backbone && _link_table.find(packet.destination_hash()) == _link_table.end()) {
-								WLOG(packet, "NEXT-HOP-NO-PATH: " + std::string(pkt_type_name(packet.packet_type())) + " dest=" + packet.destination_hash().toHex().substr(0,8) + " — we are next hop but no path, requesting");
+								WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - NO-PATH next-hop, requesting");
 								request_path(packet.destination_hash(), packet.receiving_interface());
 							}
 						}
@@ -1927,9 +1984,9 @@ static const char* pkt_type_name(uint8_t t) {
 					if (dest.hash() == packet.destination_hash()) { is_local_destination = true; break; }
 				}
 #endif
-				NOTICE("FWD-CHECK: " + std::string(pkt_type_name(packet.packet_type())) + " dest=" + packet.destination_hash().toHex().substr(0,8) + " local=" + (is_local_destination ? "Y" : "N") + " backbone=" + (is_backbone_interface(packet.receiving_interface()) ? "Y" : "N"));
+				NOTICE("FWD-CHECK - FROM: " + packet.receiving_interface().toString() + " (" + zone_tag(is_backbone_interface(packet.receiving_interface())) + ") TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") " + (is_local_destination ? "LOCAL" : "FWD"));
 				if (is_local_destination) {
-					NOTICE("SKIP-FWD: dest=" + packet.destination_hash().toHex().substr(0,8) + " is registered as local destination, not forwarding");
+					NOTICE("SKIP-FWD - TO: " + short_hash(packet.destination_hash()) + " is local dest");
 				}
 				// Forward link proofs (delivery confirmations on established links)
 				if (!is_local_destination && packet.packet_type() == Type::Packet::PROOF) {
@@ -1937,7 +1994,7 @@ static const char* pkt_type_name(uint8_t t) {
 					if (link_it != _link_table.end()) {
 						LinkEntry& le = (*link_it).second;
 						Interface out_iface = find_interface_from_hash(le._outbound_interface.get_hash());
-						NOTICE("FWD-LINK-PROOF: link=" + packet.destination_hash().toHex().substr(0,8) + " via " + (out_iface ? out_iface.toString() : "NULL"));
+						NOTICE("[PROOF] - FROM: " + packet.receiving_interface().toString() + " (" + zone_tag(is_backbone_interface(packet.receiving_interface())) + ") - TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - FWD: " + (out_iface ? out_iface.toString() : "?") + " (" + (out_iface ? zone_tag(is_backbone_interface(out_iface)) : "?") + ") LINK-PROOF");
 						if (out_iface) transmit(out_iface, packet.raw());
 					}
 				}
@@ -1947,7 +2004,7 @@ static const char* pkt_type_name(uint8_t t) {
 						const PathEntry* entry = select_path(packet.destination_hash());
 						if (entry) {
 							Interface outbound_interface = find_interface_from_hash(entry->receiving_interface);
-							NOTICE("FWD-LOCAL: " + std::string(pkt_type_name(packet.packet_type())) + " dest=" + packet.destination_hash().toHex().substr(0,8) + " hops=" + std::to_string(entry->hops) + " via " + (outbound_interface ? outbound_interface.toString() : "NULL-IFACE"));
+							NOTICE("[" + std::string(pkt_type_name(packet.packet_type())) + "] - FROM: " + packet.receiving_interface().toString() + " (" + zone_tag(is_backbone_interface(packet.receiving_interface())) + ") - TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - FWD: " + (outbound_interface ? outbound_interface.toString() : "?") + " (" + (outbound_interface ? zone_tag(is_backbone_interface(outbound_interface)) : "?") + ") hops=" + std::to_string(entry->hops));
 							if (!outbound_interface) {
 								// Path entry references an interface that no longer exists
 								// (e.g. after reboot with persistent path table).
@@ -2027,9 +2084,7 @@ static const char* pkt_type_name(uint8_t t) {
 								flatmap_erase(_reverse_table, th); _reverse_table.push_back({th, reverse_entry});
 								// Whitelist the truncated hash so the return proof
 								// from the backbone isn't blocked by the firewall.
-								if (std::find(_firewall_mentioned_addresses.begin(), _firewall_mentioned_addresses.end(), th) == _firewall_mentioned_addresses.end()) {
-									_firewall_mentioned_addresses.push_back(th);
-								}
+								wl2_push(th);
 							}
 
 							DEBUG(" Forwarding local packet (" + std::to_string(remaining_hops) + " hops, " + std::to_string(new_raw.size()) + " bytes) to " + outbound_interface.toString() + " for " + packet.destination_hash().toHex());
@@ -2052,7 +2107,7 @@ static const char* pkt_type_name(uint8_t t) {
 							// (link data packets are handled by link transport below,
 							// not by standard transport path lookup).
 							if (_link_table.find(packet.destination_hash()) == _link_table.end()) {
-								WLOG(packet, "NO-PATH-FWD: " + std::string(pkt_type_name(packet.packet_type())) + " dest=" + packet.destination_hash().toHex().substr(0,8) + " — no path, requesting");
+								WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - NO-PATH requesting");
 								request_path(packet.destination_hash(), packet.receiving_interface());
 							}
 						}
@@ -2433,8 +2488,8 @@ static const char* pkt_type_name(uint8_t t) {
 						{
 							bool is_backbone = is_backbone_interface(packet.receiving_interface());
 							if (!is_backbone) {
-								_firewall_local_addresses.push_back(packet.destination_hash());
-								DEBUG(" Registered local address " + packet.destination_hash().toHex() + " from local interface");
+								wl1_push(packet.destination_hash());
+								NOTICE("WL#1 ADD - " + packet.destination_hash().toHex().substr(0,8) + " (from LAN)");
 							}
 						}
 #endif
@@ -2505,7 +2560,7 @@ static const char* pkt_type_name(uint8_t t) {
 
 		// Handling for link requests to local destinations
 		else if (packet.packet_type() == Type::Packet::LINKREQUEST) {
-			WLOG(packet, "LINKREQ-IN:");
+			WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LINKREQ-IN");
 			if (!packet.transport_id() || packet.transport_id() == _identity.hash()) {
 				TRACE("Transport::inbound: Checking if LINKREQUEST is for local destination");
 				bool found_local = false;
@@ -2549,7 +2604,7 @@ static const char* pkt_type_name(uint8_t t) {
 							}
 						}
 					}
-					WLOG(packet, "LINKREQ-FWD: dest=" + packet.destination_hash().toHex().substr(0,8) + " via " + outbound_iface.toString() + (is_backbone_interface(outbound_iface) ? " (backbone)" : " (local)"));
+					WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - FWD: " + outbound_iface.toString() + " (" + zone_tag(is_backbone_interface(outbound_iface)) + ") LINKREQ");
 					if (outbound_iface && outbound_iface != packet.receiving_interface()) {
 						double now = OS::time();
 						uint8_t actual_hops = 1;
@@ -2564,9 +2619,7 @@ static const char* pkt_type_name(uint8_t t) {
 						Bytes link_id = Link::link_id_from_lr_packet(packet);
 						_link_table.erase(link_id);
 						_link_table.insert({link_id, link_entry});
-						if (std::find(_firewall_mentioned_addresses.begin(), _firewall_mentioned_addresses.end(), link_id) == _firewall_mentioned_addresses.end()) {
-							_firewall_mentioned_addresses.push_back(link_id);
-						}
+						wl2_push(link_id);
 						transmit(outbound_iface, packet.raw());
 					}
 				}
@@ -2598,7 +2651,7 @@ static const char* pkt_type_name(uint8_t t) {
 				auto iter = _destinations.find(packet.destination_hash());
 				if (iter != _destinations.end()) {
 					// Data is for a local destination
-					WLOG(packet, "LOCAL-DELIVER: dest=" + packet.destination_hash().toHex().substr(0,8) + " matched local destination — delivering locally, NOT forwarding");
+					WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LAN-DELIVER");
 					auto& destination = (*iter).second;
 					if (destination.type() == packet.destination_type()) {
 						TRACE("Transport::inbound: Packet destination type " + std::to_string(packet.destination_type()) + " matched, processing");
@@ -2644,9 +2697,9 @@ static const char* pkt_type_name(uint8_t t) {
 				// This is a link request proof, check if it
 				// needs to be transported
 				if ((true) && _link_table.find(packet.destination_hash()) != _link_table.end()) {
-					WLOG(packet, "LRPROOF-FWD: link_id=" + packet.destination_hash().toHex().substr(0,8) + " found in link_table, forwarding");
 					DEBUG("LRPROOF-XPORT: handling proof for link " + packet.destination_hash().toHex().substr(0,8));
 					LinkEntry& link_entry = (*_link_table.find(packet.destination_hash())).second;
+					WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - FWD: " + link_entry._receiving_interface.toString() + " (" + zone_tag(is_backbone_interface(link_entry._receiving_interface)) + ") LRPROOF");
 					DEBUG("LRPROOF-XPORT: recv_iface=" + packet.receiving_interface().toString() + " entry_out=" + link_entry._outbound_interface.toString() + " entry_recv=" + link_entry._receiving_interface.toString());
 
 					bool interface_match = (packet.receiving_interface() == link_entry._outbound_interface);
@@ -2663,7 +2716,7 @@ static const char* pkt_type_name(uint8_t t) {
 								Bytes peer_pub_bytes = packet.data().mid(Type::Identity::SIGLENGTH/8, Type::Link::ECPUBSIZE/2);
 								Identity peer_identity = Identity::recall(link_entry._destination_hash);
 								if (!peer_identity) {
-									WLOG(packet, "LRPROOF-FAIL: cannot recall identity for dest=" + link_entry._destination_hash.toHex().substr(0,8) + " — announce cache missing");
+									WLOG(packet, "TO: " + short_hash(link_entry._destination_hash) + " (" + dest_zone(link_entry._destination_hash) + ") - LRPROOF-FAIL: no identity in cache");
 								}
 								else {
 								DEBUG("LRPROOF-XPORT: peer identity recalled for " + link_entry._destination_hash.toHex().substr(0,8));
@@ -2686,26 +2739,26 @@ static const char* pkt_type_name(uint8_t t) {
 									DEBUG("LRPROOF-XPORT: transmit() returned OK");
 								}
 								else {
-									WLOG(packet, "LRPROOF-FAIL: invalid signature for link " + packet.destination_hash().toHex().substr(0,8) + ", dropping proof.");
+									WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LRPROOF-FAIL: invalid signature");
 								}
 								} // end peer_identity valid
 							}
 							else {
-								WLOG(packet, "LRPROOF-FAIL: data_size=" + std::to_string(packet.data().size()) + " expected=" + std::to_string(expected_size) + " or " + std::to_string(expected_size_with_mtu) + ", dropping proof.");
+								WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LRPROOF-FAIL: bad size " + std::to_string(packet.data().size()) + " expected " + std::to_string(expected_size));
 							}
 						}
 						catch (std::exception& e) {
-							WLOG(packet, "LRPROOF-FAIL: exception: " + std::string(e.what()));
+							WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LRPROOF-FAIL: " + std::string(e.what()));
 						}
 					}
 					else {
-						WLOG(packet, "LRPROOF-FAIL: iface mismatch recv=" + packet.receiving_interface().toString() + " expected_out=" + link_entry._outbound_interface.toString() + " expected_recv=" + link_entry._receiving_interface.toString());
+						WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LRPROOF-FAIL: iface mismatch");
 					}
 				}
 				else {
 					// Not in link_table or transport not enabled — check
 					// if we can deliver it to a local pending link
-					NOTICE("LRPROOF-DROP: link_id=" + packet.destination_hash().toHex().substr(0,8) + " NOT in link_table (lt_size=" + std::to_string(_link_table.size()) + " pl_size=" + std::to_string(_pending_links.size()) + ")");
+					NOTICE("[PROOF] - TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LRPROOF-DROP not in link_table (lt=" + std::to_string(_link_table.size()) + " pl=" + std::to_string(_pending_links.size()) + ")");
 					// CBA Must make a copy of _pending_links before traversing since it gets modified
 					//for (auto link : _pending_links) {
 					std::set<Link> pending_links(_pending_links);
@@ -2746,7 +2799,7 @@ static const char* pkt_type_name(uint8_t t) {
 				// Check if this proof needs to be transported
 				if ((true) && flatmap_find(_reverse_table, packet.destination_hash()) != _reverse_table.end()) {
 					ReverseEntry reverse_entry = (*flatmap_find(_reverse_table, packet.destination_hash())).second;
-					NOTICE("PROOF-REV: proof arrived on " + packet.receiving_interface().toString() + " (expected " + reverse_entry._outbound_interface.toString() + "), forwarding to " + reverse_entry._receiving_interface.toString());
+					NOTICE("[PROOF] - FROM: " + packet.receiving_interface().toString() + " (" + zone_tag(is_backbone_interface(packet.receiving_interface())) + ") - TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - FWD: " + reverse_entry._receiving_interface.toString() + " (" + zone_tag(is_backbone_interface(reverse_entry._receiving_interface)) + ") REV");
 					if (packet.receiving_interface() == reverse_entry._outbound_interface) {
 						TRACE("Proof received on correct interface, transporting it via " + reverse_entry._receiving_interface.toString());
 						// CBA RESERVE
@@ -2762,7 +2815,7 @@ static const char* pkt_type_name(uint8_t t) {
 					}
 				}
 				else {
-					NOTICE("PROOF-NO-REV: proof dest=" + packet.destination_hash().toHex().substr(0,8) + " — no reverse entry found, cannot forward");
+					NOTICE("[PROOF] - TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - NO-REV cannot forward");
 				}
 
 				std::list<PacketReceipt> cull_receipts;
@@ -3384,7 +3437,7 @@ will announce it.
 
 /*static*/ void Transport::path_request_handler(const Bytes& data, const Packet& packet) {
 	TRACE("Transport::path_request_handler");
-	if (data.size() >= 16) { WLOG(packet, "PATH-REQ-IN: for " + data.left(16).toHex().substr(0,8) + " from " + packet.receiving_interface().toString()); }
+	if (data.size() >= 16) { WLOG(packet, "PATH-REQ for " + data.left(16).toHex().substr(0,8) + " from " + packet.receiving_interface().toString()); }
 	try {
 		// If there is at least bytes enough for a destination
 		// hash in the packet, we assume those bytes are the
@@ -3432,7 +3485,7 @@ will announce it.
 					);
 				}
 				else {
-					NOTICE("PATH-REQ-DUP: ignoring duplicate tagged path request for " + destination_hash.toHex().substr(0,8));
+					NOTICE("[PKT] PATH-REQ-DUP for " + destination_hash.toHex().substr(0,8));
 				}
 			}
 			else {
@@ -3584,7 +3637,7 @@ will announce it.
 #if defined(FIREWALL_MODE)
 			// Track this destination in Whitelist 2 so the path
 			// response announce from the backbone will be allowed through
-			_firewall_mentioned_addresses.push_back(destination_hash);
+			wl2_push(destination_hash);
 #endif
 
 #if defined(INTERFACES_SET)
@@ -3986,14 +4039,14 @@ TRACE("Transport::write_path_table: buffer size " + std::to_string(Persistence::
 
 	OS::dump_heap_stats();
 
-	size_t memory = OS::heap_available();
-	size_t flash = OS::storage_available();
+	size_t mem_used = OS::heap_size() - OS::heap_available();
+	size_t flash_used = OS::storage_size() - OS::storage_available();
 
 	if (_last_memory == 0) {
-		_last_memory = memory;
+		_last_memory = mem_used;
 	}
 	if (_last_flash == 0) {
-		_last_flash = flash;
+		_last_flash = flash_used;
 	}
 
 	// memory
@@ -4003,7 +4056,7 @@ TRACE("Transport::write_path_table: buffer size " + std::to_string(Persistence::
 	// _reverse_table
 	// _announce_table
 	// _held_announces
-	HEADF(LOG_VERBOSE, "mem: %u (%u%%) [%d] flash: %u (%u%%) [%d] paths: %u dsts: %u revr: %u annc: %u held: %u", memory, (int)((double)memory / (double)OS::heap_size() * 100.0), memory - _last_memory, flash, (int)((double)flash / (double)OS::storage_size() * 100.0), flash - _last_flash, _destination_table.size(), _destinations.size(), _reverse_table.size(), _announce_table.size(), _held_announces.size());
+	HEADF(LOG_VERBOSE, "heap: %u/%u (%u%%) [%+d] flash: %u/%u (%u%%) [%+d] paths: %u dsts: %u revr: %u annc: %u held: %u", mem_used, OS::heap_size(), (int)((double)mem_used / (double)OS::heap_size() * 100.0), mem_used - _last_memory, flash_used, OS::storage_size(), (int)((double)flash_used / (double)OS::storage_size() * 100.0), flash_used - _last_flash, _destination_table.size(), _destinations.size(), _reverse_table.size(), _announce_table.size(), _held_announces.size());
 
 	// _path_requests
 	// _discovery_path_requests
@@ -4031,9 +4084,24 @@ TRACE("Transport::write_path_table: buffer size " + std::to_string(Persistence::
 	VERBOSEF("bla: %u bma: %u", _firewall_local_addresses.size(), _firewall_mentioned_addresses.size());
 	VERBOSEF("pin: %u pout: %u padd: %u dpr: %u ikd: %u ia: %u\r\n", _packets_received, _packets_sent, _destinations_added, destination_path_responses, Identity::_known_destinations.size(), interface_announces);
 
-	_last_memory = memory;
-	_last_flash = flash;
+	_last_memory = mem_used;
+	_last_flash = flash_used;
 
+}
+
+/*static*/ void Transport::dump_whitelists() {
+#ifdef FIREWALL_MODE
+	Serial.printf("[WL#1] %u entries:", _firewall_local_addresses.size());
+	for (auto& addr : _firewall_local_addresses) {
+		Serial.printf(" %s", addr.toHex().substr(0,8).c_str());
+	}
+	Serial.printf("\r\n");
+	Serial.printf("[WL#2] %u entries:", _firewall_mentioned_addresses.size());
+	for (auto& addr : _firewall_mentioned_addresses) {
+		Serial.printf(" %s", addr.toHex().substr(0,8).c_str());
+	}
+	Serial.printf("\r\n");
+#endif
 }
 
 /*static*/ void Transport::exit_handler() {

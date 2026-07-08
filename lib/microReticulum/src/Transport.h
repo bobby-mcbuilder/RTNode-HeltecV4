@@ -426,6 +426,9 @@ namespace RNS {
 		static const char* packet_whitelist_annotation(const Packet& packet);
 
 		// CBA
+		static void dump_whitelists();
+
+		// CBA
 		static void cull_path_table();
 
 		/// Select the best non-expired path for a destination by score = bitrate/(hops+1).

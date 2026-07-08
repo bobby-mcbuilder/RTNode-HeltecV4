@@ -5,6 +5,17 @@
 #ifdef HAS_RNS
 
 #include <Log.h>
+#include <sys/stat.h>
+
+// Safe existence check that uses stat() directly instead of FS.exists().
+// FS.exists() on LittleFS calls LittleFSImpl::exists() which internally
+// calls VFSImpl::open(path, "r") — and that triggers the noisy
+// "does not exist, no permits for creation" VFS error (vfs_api.cpp:105)
+// whenever the file/directory is absent.
+static bool path_exists(const char* path) {
+	struct stat st;
+	return (::stat(path, &st) == 0);
+}
 
 #if FS_TYPE == FS_TYPE_INTERNALFS
 
@@ -104,6 +115,15 @@ bool FileSystem::init() {
 		}
 		else {
 			remove_file("/test");
+		}
+
+		// Ensure cache directory exists before Transport starts.
+		// If this fails, packet caching will be unavailable but the
+		// node will still operate (paths just won't survive reboots).
+		if (!directory_exists("/cache")) {
+			if (!create_directory("/cache")) {
+				HEAD("Failed to create /cache directory — packet cache will be unavailable", RNS::LOG_CRITICAL);
+			}
 		}
 	}
 	catch (std::exception& e) {
@@ -267,11 +287,21 @@ void FileSystem::dumpDir(const char* dir) {
 	}
 	return false;
 */
-	return FS.exists(file_path);
+	return path_exists(file_path);
 }
 
 /*virtua*/ size_t FileSystem::read_file(const char* file_path, RNS::Bytes& data) {
 	TRACEF("read_file: reading from file %s", file_path);
+
+	// Avoid VFS noise: don't attempt to open a file that doesn't exist,
+	// since FS.open(path, FILE_READ) on a missing file triggers a
+	// misleading "does not exist, no permits for creation" error from
+	// the ESP-IDF VFS layer (vfs_api.cpp:105).
+	if (!path_exists(file_path)) {
+		TRACEF("read_file: file %s does not exist, skipping", file_path);
+		return 0;
+	}
+
 	size_t read = 0;
 #if FS_TYPE == FS_TYPE_INTERNALFS || FS_TYPE == FS_TYPE_FLASHFS
 	File file(FS);
@@ -298,8 +328,27 @@ void FileSystem::dumpDir(const char* dir) {
 
 /*virtua*/ size_t FileSystem::write_file(const char* file_path, const RNS::Bytes& data) {
 	TRACEF("write_file: writing to file %s", file_path);
+
+	// Avoid VFS noise: ensure the parent directory exists before
+	// attempting FS.open(FILE_WRITE).  On some framework versions
+	// the VFS wrapper may still emit the "does not exist" error
+	// even for write/create modes.
+	const char* last_slash = strrchr(file_path, '/');
+	if (last_slash != nullptr && last_slash != file_path) {
+		// file_path has a parent directory (e.g. "/cache/hash")
+		size_t dir_len = last_slash - file_path;
+		if (dir_len < 128) {
+			char dir_path[128];
+			memcpy(dir_path, file_path, dir_len);
+			dir_path[dir_len] = '\0';
+			if (!path_exists(dir_path)) {
+				FS.mkdir(dir_path);
+			}
+		}
+	}
+
 	// CBA TODO Replace remove with working truncation
-	if (FS.exists(file_path)) {
+	if (path_exists(file_path)) {
 		FS.remove(file_path);
 	}
 	size_t wrote = 0;
@@ -337,7 +386,7 @@ void FileSystem::dumpDir(const char* dir) {
 	else if (file_mode == RNS::FileStream::MODE_WRITE) {
 		mode = FILE_O_WRITE;
 		// CBA TODO Replace remove with working truncation
-		if (FS.exists(file_path)) {
+		if (path_exists(file_path)) {
 			FS.remove(file_path);
 		}
 	}
@@ -377,7 +426,14 @@ void FileSystem::dumpDir(const char* dir) {
 		return {RNS::Type::NONE};
 	}
 	TRACEF("open_file: opening file %s in mode %s", file_path, mode);
-	// CBA Using copy constructor to obtain File*
+
+	// Avoid VFS noise: don't attempt to open a file that doesn't exist
+	// in read mode (same issue as read_file).
+	if (file_mode == RNS::FileStream::MODE_READ && !path_exists(file_path)) {
+		TRACEF("open_file: file %s does not exist, skipping", file_path);
+		return {RNS::Type::NONE};
+	}
+
 	File* file = new File(FS.open(file_path, mode));
 	if (file == nullptr || !(*file)) {
 		ERRORF("open_file: failed to open output file %s", file_path);
@@ -400,6 +456,14 @@ void FileSystem::dumpDir(const char* dir) {
 
 /*virtua*/ bool FileSystem::directory_exists(const char* directory_path) {
 	TRACEF("directory_exists: checking for existence of directory %s", directory_path);
+
+	// Use path_exists() (stat-based) instead of FS.open(dir, FILE_READ) to avoid the
+	// noisy VFS "does not exist, no permits for creation" error on
+	// missing directories (same issue as read_file).
+	if (!path_exists(directory_path)) {
+		return false;
+	}
+
 #if FS_TYPE == FS_TYPE_INTERNALFS || FS_TYPE == FS_TYPE_FLASHFS
 	File file(FS);
 	if (file.open(directory_path, FILE_O_READ)) {
