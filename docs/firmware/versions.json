@@ -1,5 +1,18 @@
 [
   {
+    "tag": "v1.0.42",
+    "name": "v1.0.42",
+    "stability": "beta",
+    "prerelease": false,
+    "published_at": "2026-07-08T16:24:08Z",
+    "assets": [
+      "rtnode_heltec_v3.bin",
+      "rtnode_heltec_v3_merged.bin",
+      "rtnode_heltec_v4.bin",
+      "rtnode_heltec_v4_merged.bin"
+    ]
+  },
+  {
     "tag": "v1.0.41",
     "name": "v1.0.41 \u2014 Firewall bidirectional forwarding, link-proof relay",
     "stability": "beta",
