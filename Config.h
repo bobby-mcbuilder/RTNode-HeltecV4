@@ -20,8 +20,8 @@
 	#define CONFIG_H
 
 	#define MAJ_VERS  0x01
-	#define MIN_VERS  0x2A
-	#define FW_RELEASE_TAG "1.0.42"
+	#define MIN_VERS  0x2B
+	#define FW_RELEASE_TAG "1.0.43"
 
 	#define MODE_HOST 0x11
 	#define MODE_TNC  0x12
@@ -164,6 +164,7 @@
 	uint8_t last_rssi_raw   = 0x00;
 	uint8_t last_snr_raw	= 0x80;
 	uint8_t seq				= 0xFF;
+	uint8_t last_seq		= 0xFF;  // sequence of most recently completed split
 	uint16_t read_len		= 0;
 	uint16_t host_write_len = 0;
 
