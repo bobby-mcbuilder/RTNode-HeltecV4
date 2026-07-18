@@ -1,5 +1,18 @@
 [
   {
+    "tag": "v1.0.44",
+    "name": "v1.0.44 \u2014 Backbone hop-count fix, LoRa receive path parity",
+    "stability": "beta",
+    "prerelease": false,
+    "published_at": "2026-07-18T00:00:00Z",
+    "assets": [
+      "rtnode_heltec_v3.bin",
+      "rtnode_heltec_v3_merged.bin",
+      "rtnode_heltec_v4.bin",
+      "rtnode_heltec_v4_merged.bin"
+    ]
+  },
+  {
     "tag": "v1.0.43",
     "name": "v1.0.43 \u2014 LoRa receive path fix (upstream parity), transport relay hop fix",
     "stability": "beta",
