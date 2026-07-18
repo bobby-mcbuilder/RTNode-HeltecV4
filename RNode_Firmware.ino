@@ -95,8 +95,6 @@ volatile uint16_t queued_bytes = 0;
 volatile uint16_t queue_cursor = 0;
 volatile uint16_t current_packet_start = 0;
 volatile bool serial_buffering = false;
-static uint8_t last_lora_phy_header = 0;
-static bool last_lora_phy_header_valid = false;
 #if HAS_BLUETOOTH || HAS_BLE == true
   bool bt_init_ran = false;
 #endif
@@ -111,7 +109,6 @@ static bool last_lora_phy_header_valid = false;
           size_t len;
           int rssi;
           int snr_raw;
-      uint8_t phy_header;
           uint8_t data[];
   } modem_packet_t;
   static xQueueHandle modem_packet_queue = NULL;
@@ -1277,13 +1274,6 @@ inline void kiss_write_packet() {
   // CBA RESERVE
   //RNS::Bytes data();
   RNS::Bytes data(512);
-#ifdef FIREWALL_MODE
-  if (last_lora_phy_header_valid && host_write_len > 2 && pbuf[1] > 16) {
-    VERBOSEF("[LoRa] RX raw-shift fix: prepend 0x%02x (hops byte was %u)",
-        last_lora_phy_header, (unsigned)pbuf[1]);
-    data << last_lora_phy_header;
-  }
-#endif
   for (uint16_t i = 0; i < host_write_len; i++) {
     #if MCU_VARIANT == MCU_NRF52
       portENTER_CRITICAL();
@@ -1295,7 +1285,6 @@ inline void kiss_write_packet() {
     data << byte;
   }
   lora_interface.handle_incoming(data);
-  last_lora_phy_header_valid = false;
 #endif
 
   serial_write(FEND);
@@ -1358,40 +1347,33 @@ void ISR_VECT receive_callback(int packet_size) {
     uint8_t sequence = packetSequence(header);
     bool    ready    = false;
 
-    #ifdef FIREWALL_MODE
-      // Some Reticulum LoRa peers transmit raw RNS frames without the
-      // RNode split/framing byte. If we strip the first byte in that case,
-      // the RNS header shifts left and packets unpack as nonsense hops and
-      // contexts. Non-split RNode framing uses a low nibble of 0; split
-      // RNode frames are full-size fragments. Raw RNS control/announce
-      // frames seen here have a non-zero low nibble and fit in one LoRa frame.
-      if ((header & 0x0F) != 0 && (packet_size + 1) < SINGLE_MTU) {
-        read_len = 0;
-        pbuf[read_len++] = header;
-        getPacketData(packet_size);
-        ready = true;
-      }
-      else
-    #endif
-
     if (isSplitPacket(header) && seq == SEQ_UNSET) {
-      // This is the first part of a split
-      // packet, so we set the seq variable
-      // and add the data to the buffer
-      #if MCU_VARIANT == MCU_NRF52
-        int_mask = taskENTER_CRITICAL_FROM_ISR(); read_len = 0; taskEXIT_CRITICAL_FROM_ISR(int_mask);
-      #else
-        read_len = 0;
-      #endif
-      
-      seq = sequence;
+      // Trailing empty frame from a just-completed split?  The
+      // transmit-side off-by-one emits a frame with 0 data bytes
+      // when the raw size is an exact multiple of the frame cap.
+      // Recognise it by matching last_seq and discard without
+      // poisoning state.
+      if (packet_size == 0 && sequence == last_seq) {
+        // Belongs to the previous split — nothing to do.
+      } else {
+        // This is the first part of a split
+        // packet, so we set the seq variable
+        // and add the data to the buffer
+        #if MCU_VARIANT == MCU_NRF52
+          int_mask = taskENTER_CRITICAL_FROM_ISR(); read_len = 0; taskEXIT_CRITICAL_FROM_ISR(int_mask);
+        #else
+          read_len = 0;
+        #endif
+        
+        seq = sequence;
 
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
-        last_rssi = LoRa->packetRssi();
-        last_snr_raw = LoRa->packetSnrRaw();
-      #endif
+        #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+          last_rssi = LoRa->packetRssi();
+          last_snr_raw = LoRa->packetSnrRaw();
+        #endif
 
-      getPacketData(packet_size);
+        getPacketData(packet_size);
+      }
 
     } else if (isSplitPacket(header) && seq == sequence) {
       // This is the second part of a split
@@ -1403,6 +1385,7 @@ void ISR_VECT receive_callback(int packet_size) {
       #endif
 
       getPacketData(packet_size);
+      last_seq = sequence;  // remember for trailing-empty-frame detection
       seq = SEQ_UNSET;
       ready = true;
 
@@ -1431,23 +1414,60 @@ void ISR_VECT receive_callback(int packet_size) {
       // flag to true.
 
       if (seq != SEQ_UNSET) {
-        // If we already had part of a split
-        // packet in the buffer, we clear it.
-        #if MCU_VARIANT == MCU_NRF52
-          int_mask = taskENTER_CRITICAL_FROM_ISR(); read_len = 0; taskEXIT_CRITICAL_FROM_ISR(int_mask);
+        // A split-packet reassembly is in progress.  Deliver this
+        // non-split packet through a side channel without touching
+        // pbuf or seq — read straight from the LoRa FIFO into a
+        // modem_packet allocation.
+        #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+        {
+          modem_packet_t *mp = modem_packet_alloc(packet_size);
+          if (mp) {
+            #if MCU_VARIANT == MCU_ESP32
+              mp->snr_raw = LoRa->packetSnrRaw();
+              mp->rssi    = LoRa->packetRssi(mp->snr_raw);
+            #endif
+            mp->len = packet_size;
+            for (uint16_t i = 0; i < packet_size; i++) {
+              mp->data[i] = LoRa->read();
+            }
+            if (!modem_packet_queue
+                || xQueueSendFromISR(modem_packet_queue, &mp, NULL) != pdPASS) {
+              modem_packet_free(mp);
+            }
+          }
+          // pbuf, read_len, and seq are untouched — frame 2 will
+          // still match when it arrives.
+        }
         #else
-          read_len = 0;
+          // On single-threaded MCUs we cannot easily buffer a
+          // side-channel delivery, so fall back to the original
+          // behaviour: the in-progress split is discarded.
+          // (RTNode targets ESP32 / nRF52, so this path is
+          //  not exercised in Firewall Mode.)
+          #if MCU_VARIANT == MCU_NRF52
+            int_mask = taskENTER_CRITICAL_FROM_ISR(); read_len = 0; taskEXIT_CRITICAL_FROM_ISR(int_mask);
+          #else
+            read_len = 0;
+          #endif
+          seq = SEQ_UNSET;
+
+          #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+            last_rssi = LoRa->packetRssi();
+            last_snr_raw = LoRa->packetSnrRaw();
+          #endif
+
+          getPacketData(packet_size);
+          ready = true;
         #endif
-        seq = SEQ_UNSET;
+      } else {
+        #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
+          last_rssi = LoRa->packetRssi();
+          last_snr_raw = LoRa->packetSnrRaw();
+        #endif
+
+        getPacketData(packet_size);
+        ready = true;
       }
-
-      #if MCU_VARIANT != MCU_ESP32 && MCU_VARIANT != MCU_NRF52
-        last_rssi = LoRa->packetRssi();
-        last_snr_raw = LoRa->packetSnrRaw();
-      #endif
-
-      getPacketData(packet_size);
-      ready = true;
     }
 
     if (ready) {
@@ -1472,8 +1492,6 @@ void ISR_VECT receive_callback(int packet_size) {
           modem_packet->snr_raw = LoRa->packetSnrRaw();
           modem_packet->rssi = LoRa->packetRssi(modem_packet->snr_raw);
         #endif
-        modem_packet->phy_header = header;
-
         // Send packet to event queue, but free the
         // allocated memory again if the queue is
         // unable to receive the packet.
@@ -1731,7 +1749,7 @@ void transmit(uint16_t size) {
       for (uint16_t i=0; i < size; i++) {
         LoRa->write(tbuf[i]); written++;
 
-        if (written == 255 && isSplitPacket(header)) {
+        if (written == 255 && isSplitPacket(header) && (i + 1 < size)) {
           if (!LoRa->endPacket()) {
             kiss_indicate_error(ERROR_MODEM_TIMEOUT);
             kiss_indicate_error(ERROR_TXFAILED);
@@ -2825,7 +2843,7 @@ void loop() {
         uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         Serial.printf("[HEAP] free=%u min=%u max_alloc=%u psram=%u\r\n",
                       free_heap, ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(), psram_free);
-        // RNS::Transport::dump_whitelists();
+        RNS::Transport::dump_whitelists();
       }
     }
 
@@ -2914,8 +2932,6 @@ void loop() {
         host_write_len = modem_packet->len;
         last_rssi      = modem_packet->rssi;
         last_snr_raw   = modem_packet->snr_raw;
-        last_lora_phy_header = modem_packet->phy_header;
-        last_lora_phy_header_valid = true;
         memcpy(&pbuf, modem_packet->data, modem_packet->len);
         modem_packet_free(modem_packet);
         modem_packet = NULL;
@@ -2934,8 +2950,6 @@ void loop() {
       if(modem_packet_queue && xQueueReceive(modem_packet_queue, &modem_packet, 0) == pdTRUE && modem_packet) {
         memcpy(&pbuf, modem_packet->data, modem_packet->len);
         host_write_len = modem_packet->len;
-        last_lora_phy_header = modem_packet->phy_header;
-        last_lora_phy_header_valid = true;
         modem_packet_free(modem_packet);
         modem_packet = NULL;
 

@@ -108,8 +108,6 @@ static void flatset_insert(std::vector<Bytes>& vec, const Bytes& key) {
 
 /*static*/ std::set<Destination> Transport::_control_destinations;
 /*static*/ std::set<Bytes> Transport::_control_hashes;
-
-
 /*static*/ std::map<Bytes, Bytes> Transport::_pending_local_path_requests;
 
 /*static*/ double Transport::_start_time				= 0.0;
@@ -261,6 +259,22 @@ static const char* pkt_type_name(uint8_t t) {
 		default: return "?";
 	}
 }
+// Human-readable context name for resource tracing
+static const char* ctx_name(uint8_t ctx) {
+	switch (ctx) {
+		case 0x01: return "RESOURCE";
+		case 0x02: return "RESOURCE_ADV";
+		case 0x03: return "RESOURCE_REQ";
+		case 0x04: return "RESOURCE_HMU";
+		case 0x05: return "RESOURCE_PRF";
+		case 0x06: return "RESOURCE_ICL";
+		case 0x07: return "RESOURCE_RCL";
+		default:   return nullptr;
+	}
+}
+static inline bool is_resource_ctx(uint8_t ctx) {
+	return ctx >= 0x01 && ctx <= 0x07;
+}
 /*static*/ Identity Transport::_identity({Type::NONE});
 
 // CBA
@@ -380,8 +394,6 @@ static const char* pkt_type_name(uint8_t t) {
 	}
 
 // TODO
-
-
 //#ifndef NDEBUG
 	// CBA DEBUG
 	dump_stats();
@@ -1185,8 +1197,6 @@ static const char* pkt_type_name(uint8_t t) {
 							if (packet.hops() > 0) {
 
 // TODO
-
-
 								bool queued_announces = (interface.announce_queue().size() > 0);
 								if (!queued_announces && outbound_time > interface.announce_allowed_at()) {
 									uint16_t wait_time = 0;
@@ -1556,8 +1566,6 @@ static const char* pkt_type_name(uint8_t t) {
 	};
 
 // TODO
-
-
 	//if (packet_filter(packet)) {
 	// CBA
 	bool accept = true;
@@ -1748,6 +1756,10 @@ static const char* pkt_type_name(uint8_t t) {
 		// Log ALL non-announce packets arriving from local (non-backbone) interfaces
 		if (!is_backbone_interface(packet.receiving_interface()) && packet.packet_type() != Type::Packet::ANNOUNCE) {
 			WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - LAN-IN hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
+		}
+		// Resource packet trace: log any resource-context packet entering inbound
+		if (is_resource_ctx(packet.context())) {
+			WLOG(packet, std::string(ctx_name(packet.context())) + " IN  hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()) + " dst=" + short_hash(packet.destination_hash()));
 		}
 #endif
 		
@@ -2208,9 +2220,9 @@ static const char* pkt_type_name(uint8_t t) {
 				TRACE("Transport::inbound: Checking if packet is meant for link transport...");
 				auto link_iter = _link_table.find(packet.destination_hash());
 				if (link_iter != _link_table.end()) {
-					DEBUG("LINK-XPORT: pkt for " + packet.destination_hash().toHex().substr(0,8) + " type=" + std::to_string(packet.packet_type()) + " ctx=" + std::to_string(packet.context()) + " hops=" + std::to_string(packet.hops()) + " from=" + packet.receiving_interface().toString() + " hdr=" + std::to_string(packet.header_type()) + " sz=" + std::to_string(packet.raw().size()));
 					LinkEntry& link_entry = (*link_iter).second;
-					DEBUG("LINK-XPORT: entry hops=" + std::to_string(link_entry._hops) + " rem=" + std::to_string(link_entry._remaining_hops) + " recv=" + link_entry._receiving_interface.toString() + " out=" + link_entry._outbound_interface.toString() + " val=" + std::to_string(link_entry._validated));
+					NOTICE("LINK-XPORT: pkt " + packet.destination_hash().toHex().substr(0,8) + " type=" + std::to_string(packet.packet_type()) + " ctx=" + std::to_string(packet.context()) + " hops=" + std::to_string(packet.hops()) + " from=" + packet.receiving_interface().toString() + " sz=" + std::to_string(packet.raw().size()));
+					NOTICE("LINK-XPORT: entry hops=" + std::to_string(link_entry._hops) + " rem=" + std::to_string(link_entry._remaining_hops) + " recv=" + link_entry._receiving_interface.toString() + " out=" + link_entry._outbound_interface.toString() + " val=" + std::to_string(link_entry._validated));
 					// If receiving and outbound interface is
 					// the same for this link, direction doesn't
 					// matter, and we simply send the packet on.
@@ -2228,12 +2240,18 @@ static const char* pkt_type_name(uint8_t t) {
 						// the opposite interface of what the
 						// packet was received on.
 						if (packet.receiving_interface() == link_entry._outbound_interface) {
-							// Also check that expected hop count matches
+							// Reverse direction (from destination back toward initiator).
+							// Match Python reference Transport.py line 1611: exact match.
+							
+							
 							if (packet.hops() == link_entry._remaining_hops) {
 								outbound_interface = link_entry._receiving_interface;
 							}
 							else {
-								DEBUG("LINK-XPORT: HOP MISMATCH (from outbound) pkt.hops=" + std::to_string(packet.hops()) + " expected=" + std::to_string(link_entry._remaining_hops));
+								NOTICE("LINK-XPORT: HOP MISMATCH (from outbound) pkt.hops=" + std::to_string(packet.hops()) + " expected=" + std::to_string(link_entry._remaining_hops));
+								if (is_resource_ctx(packet.context())) {
+									WLOG(packet, std::string(ctx_name(packet.context())) + " HOP-MISMATCH rev pkt.hops=" + std::to_string(packet.hops()) + " expected=" + std::to_string(link_entry._remaining_hops));
+								}
 							}
 						}
 						else if (packet.receiving_interface() == link_entry._receiving_interface) {
@@ -2242,16 +2260,22 @@ static const char* pkt_type_name(uint8_t t) {
 								outbound_interface = link_entry._outbound_interface;
 							}
 							else {
-								DEBUG("LINK-XPORT: HOP MISMATCH (from receiving) pkt.hops=" + std::to_string(packet.hops()) + " expected=" + std::to_string(link_entry._hops));
+								NOTICE("LINK-XPORT: HOP MISMATCH (from receiving) pkt.hops=" + std::to_string(packet.hops()) + " expected=" + std::to_string(link_entry._hops));
+								if (is_resource_ctx(packet.context())) {
+									WLOG(packet, std::string(ctx_name(packet.context())) + " HOP-MISMATCH fwd pkt.hops=" + std::to_string(packet.hops()) + " expected=" + std::to_string(link_entry._hops));
+								}
 							}
 						}
 						else {
-							DEBUG("LINK-XPORT: IFACE MISMATCH recv=" + packet.receiving_interface().toString() + " entry_recv=" + link_entry._receiving_interface.toString() + " entry_out=" + link_entry._outbound_interface.toString());
+							NOTICE("LINK-XPORT: IFACE MISMATCH recv=" + packet.receiving_interface().toString() + " entry_recv=" + link_entry._receiving_interface.toString() + " entry_out=" + link_entry._outbound_interface.toString());
 						}
 					}
 
 					if (outbound_interface) {
-						DEBUG("LINK-XPORT: FWD to " + outbound_interface.toString());
+						NOTICE("LINK-XPORT: FWD to " + outbound_interface.toString());
+						if (is_resource_ctx(packet.context())) {
+							WLOG(packet, std::string(ctx_name(packet.context())) + " FWD to " + outbound_interface.toString() + " (" + zone_tag(is_backbone_interface(outbound_interface)) + ")");
+						}
 						// Add this packet to the filter hashlist now that
 						// we have determined it's actually our turn to
 						// process it (matching Python Transport line 1544).
@@ -2269,7 +2293,13 @@ static const char* pkt_type_name(uint8_t t) {
 						link_entry._timestamp = OS::time();
 					}
 					else {
-						DEBUG("LINK-XPORT: DROPPED (no outbound interface resolved)");
+						NOTICE("LINK-XPORT: DROPPED (no outbound interface resolved)");
+					}
+				}
+				else {
+					NOTICE("LINK-XPORT: dest " + packet.destination_hash().toHex().substr(0,8) + " NOT in link_table (size=" + std::to_string(_link_table.size()) + ")");
+					if (is_resource_ctx(packet.context())) {
+						WLOG(packet, std::string(ctx_name(packet.context())) + " NO-LINKTABLE (size=" + std::to_string(_link_table.size()) + ")");
 					}
 				}
 			}
@@ -2394,8 +2424,6 @@ static const char* pkt_type_name(uint8_t t) {
 						bool rate_blocked = false;
 
 // TODO
-
-
 						uint8_t retries = 0;
 						uint8_t announce_hops = packet.hops();
 						uint8_t local_rebroadcasts = 0;
@@ -3370,8 +3398,6 @@ Deregisters an announce handler.
 	}
 	return deque.size() < before;
 }
-
-
 /*
 Requests a path to the destination from the network. If
 another reachable peer on the network knows a path, it
@@ -3403,8 +3429,6 @@ will announce it.
 
 	if (on_interface && recursive) {
 // TODO
-
-
 		bool queued_announces = (on_interface.announce_queue().size() > 0);
 		if (queued_announces) {
 			TRACE("Blocking recursive path request on " + on_interface.toString() + " due to queued announces");
@@ -3694,8 +3718,6 @@ will announce it.
 	char destination_table_path[Type::Reticulum::FILEPATH_MAXSIZE];
 	snprintf(destination_table_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/destination_table", Reticulum::_storagepath);
 	if (!_owner.is_connected_to_shared_instance() && OS::file_exists(destination_table_path)) {
-
-
 		try {
 #if CUSTOM
 TRACEF("Transport::start: buffer capacity %d bytes", Persistence::_buffer.capacity());
@@ -3857,8 +3879,6 @@ TRACEF("Transport::start: buffer size %d bytes", Persistence::_buffer.size());
 			}
 			DEBUGF("Trimmed path table from %d to %d destinations for persistence", _destination_table.size(), persist_table.size());
 		}
-
-
 #if CUSTOM
 		{
 			Persistence::_document.set(persist_table);

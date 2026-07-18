@@ -412,6 +412,7 @@ namespace RNS {
 		static void clean_caches();
 		static void clear_caches_in_memory();   // aggressive in-memory cache clearing for heap pressure
 		static void dump_stats();
+		static void dump_whitelists();
 		static void exit_handler();
 
 		static uint16_t remove_reverse_entries(const std::vector<Bytes>& hashes);
@@ -424,9 +425,6 @@ namespace RNS {
 		static bool is_whitelisted_packet_address(const Bytes& destination_hash);
 		static bool packet_contains_whitelisted_address(const Packet& packet);
 		static const char* packet_whitelist_annotation(const Packet& packet);
-
-		// CBA
-		static void dump_whitelists();
 
 		// CBA
 		static void cull_path_table();
