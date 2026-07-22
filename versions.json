@@ -1,5 +1,18 @@
 [
   {
+    "tag": "v1.0.45",
+    "name": "v1.0.45 \u2014 Path request forwarding on broadcast interfaces, WL seeding fix",
+    "stability": "beta",
+    "prerelease": false,
+    "published_at": "2026-07-21T00:00:00Z",
+    "assets": [
+      "rtnode_heltec_v3.bin",
+      "rtnode_heltec_v3_merged.bin",
+      "rtnode_heltec_v4.bin",
+      "rtnode_heltec_v4_merged.bin"
+    ]
+  },
+  {
     "tag": "v1.0.44",
     "name": "v1.0.44 \u2014 Backbone hop-count fix, LoRa receive path parity",
     "stability": "beta",

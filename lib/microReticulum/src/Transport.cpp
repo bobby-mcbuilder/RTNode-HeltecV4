@@ -3654,8 +3654,13 @@ will announce it.
 			DEBUG("There is already a waiting path request for destination " + destination_hash.toHex() + " on behalf of path request" + interface_str);
 		}
 		else {
-			// Forward path request on all interfaces
-			// except the requestor interface
+			// Forward path request on all interfaces.
+			// Only skip same-interface forwarding for point-to-point
+			// interfaces (backbone) — echoing back to the sender on a
+			// point-to-point link is just noise.  Broadcast interfaces
+			// (LoRa) reach different nodes when retransmitted, and any
+			// echo is already caught by _discovery_path_requests /
+			// _discovery_pr_tags dedup.
 			DEBUG("Attempting to discover unknown path to destination " + destination_hash.toHex() + " on behalf of path request" + interface_str);
 
 #if defined(FIREWALL_MODE)
@@ -3671,17 +3676,11 @@ will announce it.
 #elif defined(INTERFACES_MAP)
 			for (auto& [hash, interface] : _interfaces) {
 #endif
-				// Only forward path requests to interfaces other than
-				// the one they arrived on — prevents WAN path requests
-				// from flooding the LoRa channel.
-				if (interface != attached_interface) {
+				if (interface == attached_interface && interface.is_backbone()) {
+					TRACE("Transport::path_request: not requesting path back to sender on backbone " + interface.toString());
+				} else {
 					TRACE("Transport::path_request: requesting path on interface " + interface.toString());
-					// Use the previously extracted tag from this path request
-					// on the new path requests as well, to avoid potential loops
 					request_path(destination_hash, interface, tag, true);
-				}
-				else {
-					TRACE("Transport::path_request: not requesting path on same interface " + interface.toString());
 				}
 			}
 		}
