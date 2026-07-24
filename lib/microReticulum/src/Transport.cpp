@@ -1881,7 +1881,8 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 						if (packet.packet_type() == Type::Packet::LINKREQUEST) {
 							TRACE("Transport::inbound: Packet is next-hop LINKREQUEST");
 							double now = OS::time();
-							double proof_timeout = now + Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * std::max((uint8_t)1, remaining_hops);
+							double proof_timeout = Transport::extra_link_proof_timeout(packet.receiving_interface())
+								+ now + Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * std::max((uint8_t)1, remaining_hops);
 
 							// === MTU Clamping (v1.0.12) ===
 							// When forwarding a LINKREQUEST through this transport node,
@@ -2059,7 +2060,8 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 							// Create link_table or reverse_table entry for return path
 							if (packet.packet_type() == Type::Packet::LINKREQUEST) {
 								double now = OS::time();
-								double proof_timeout = now + Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP
+								double proof_timeout = Transport::extra_link_proof_timeout(packet.receiving_interface())
+									+ now + Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP
 									* std::max((uint8_t)1, remaining_hops);
 
 								// === MTU Clamping (v1.0.12) ===
@@ -2157,7 +2159,8 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 								// Create link_table or reverse_table entry for return traffic
 								if (packet.packet_type() == Type::Packet::LINKREQUEST) {
 									double now = OS::time();
-									double proof_timeout = now + Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP
+									double proof_timeout = Transport::extra_link_proof_timeout(packet.receiving_interface())
+										+ now + Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP
 										* std::max((uint8_t)1, remaining_hops2);
 
 									// === MTU Clamping (v1.0.12) ===
@@ -2643,7 +2646,8 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 						LinkEntry link_entry(now, packet.destination_hash(), outbound_iface, actual_hops,
 							packet.receiving_interface(), packet.hops(),
 							packet.destination_hash(), false,
-							now + (Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * actual_hops));
+							Transport::extra_link_proof_timeout(packet.receiving_interface())
+								+ now + (Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * actual_hops));
 						Bytes link_id = Link::link_id_from_lr_packet(packet);
 						_link_table.erase(link_id);
 						_link_table.insert({link_id, link_entry});
