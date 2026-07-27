@@ -20,9 +20,8 @@
 	#define CONFIG_H
 
 	#define MAJ_VERS  0x01
-	#define MIN_VERS  0x2E
-	#define FW_RELEASE_TAG "1.0.46"
-
+  #define MIN_VERS  0x2F
+  #define FW_RELEASE_TAG "1.0.47"
 	#define MODE_HOST 0x11
 	#define MODE_TNC  0x12
 

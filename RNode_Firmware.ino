@@ -170,33 +170,28 @@ protected:
     VERBOSEF("[LoRa] TX %u bytes", data.size());
     TRACEF("LoRaInterface.send_outgoing: (%u bytes) data: %s", data.size(), data.toHex().c_str());
     TRACE("LoRaInterface.send_outgoing: adding packet to outgoing queue...");
-    for (size_t i = 0; i < data.size(); i++) {
-        if (queue_height < CONFIG_QUEUE_MAX_LENGTH && queued_bytes < CONFIG_QUEUE_SIZE) {
-            queued_bytes++;
-            packet_queue[queue_cursor++] = data.data()[i];
-            if (queue_cursor == CONFIG_QUEUE_SIZE) queue_cursor = 0;
-        }
+
+    const size_t available_bytes = CONFIG_QUEUE_SIZE - queued_bytes;
+    if (fifo16_isfull(&packet_starts) || fifo16_isfull(&packet_lengths) ||
+        queue_height >= CONFIG_QUEUE_MAX_LENGTH || data.size() > available_bytes) {
+        WARNINGF("[LoRa] TX DROP %u bytes: queue packets=%u bytes=%u",
+            data.size(), queue_height, queued_bytes);
+        return;
     }
-    if (!fifo16_isfull(&packet_starts) && queued_bytes < CONFIG_QUEUE_SIZE) {
-        uint16_t s = current_packet_start;
-        int16_t e = queue_cursor-1; if (e == -1) e = CONFIG_QUEUE_SIZE-1;
-        uint16_t l;
 
-        if (s != e) {
-            l = (s < e) ? e - s + 1 : CONFIG_QUEUE_SIZE - s + e + 1;
-        } else {
-            l = 1;
-        }
+    for (size_t i = 0; i < data.size(); i++) {
+        queued_bytes++;
+        packet_queue[queue_cursor++] = data.data()[i];
+        if (queue_cursor == CONFIG_QUEUE_SIZE) queue_cursor = 0;
+    }
 
-        if (l >= MIN_L) {
-            queue_height++;
-
-            fifo16_push(&packet_starts, s);
-            fifo16_push(&packet_lengths, l);
-
-            current_packet_start = queue_cursor;
-        }
-
+    uint16_t packet_start = current_packet_start;
+    uint16_t packet_length = data.size();
+    if (packet_length >= MIN_L) {
+        queue_height++;
+        fifo16_push(&packet_starts, packet_start);
+        fifo16_push(&packet_lengths, packet_length);
+        current_packet_start = queue_cursor;
     }
     // Perform post-send housekeeping
     InterfaceImpl::handle_outgoing(data);
