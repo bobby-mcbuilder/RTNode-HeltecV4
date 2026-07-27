@@ -1,10 +1,10 @@
 [
   {
     "tag": "v1.0.47",
-    "name": "v1.0.47 — LoRa repeater audit: atomic queue, same-interface announce propagation",
+    "name": "v1.0.47 \u2014 LoRa repeater audit: atomic queue, same-interface announce propagation",
     "stability": "beta",
     "prerelease": false,
-    "published_at": "2026-07-27T00:00:00Z",
+    "published_at": "2026-07-27T22:38:57Z",
     "assets": [
       "rtnode_heltec_v3.bin",
       "rtnode_heltec_v3_merged.bin",
