@@ -370,6 +370,35 @@ static void config_send_html() {
     html += String(firewall_state.mdns_hostname);
     html += F("'>");
 
+    // ── Diagnostics / rnprobe Section ──
+    html += F(
+        "<h2>&#x1f50d; Diagnostics (rnprobe)</h2>"
+        "<p class='note'>When enabled, this node responds to <code>rnprobe</code> utility pings "
+        "from other Reticulum nodes.  rnprobe measures round-trip time and packet loss over "
+        "the network path.  The probe destination is identity-backed and requires no link setup.</p>"
+        "<label>rnprobe Responder</label>"
+        "<select name='probe_en'>"
+    );
+    html += F("<option value='1'");
+    if (firewall_state.probe_enabled) html += F(" selected");
+    html += F(">Enabled</option>");
+    html += F("<option value='0'");
+    if (!firewall_state.probe_enabled) html += F(" selected");
+    html += F(">Disabled</option>");
+    html += F("</select>");
+
+    html += F("<div class='node-hash' style='margin-top:8px;'><span class='nh-label'>&#x1f4e8; Probe Destination</span><code>");
+    if (rtc_node_hash_magic == NODE_HASH_RTC_MAGIC && rtc_node_hash_hex[0] != '\\0') {
+        html += String(rtc_node_hash_hex);
+        html += F(".rnstransport.probe");
+    } else {
+        html += F("<span style='color:#888;font-style:italic;'>Available after first normal boot</span>");
+    }
+    html += F("</code></div>");
+    html += F("<p class='note'>Run: <code>rnprobe &lt;hash&gt;.rnstransport.probe &lt;hash&gt;</code> "
+              "from any reachable Reticulum node.  The hash is also printed in the serial log "
+              "as <code>PROBE-DST</code> at boot.</p>");
+
     // ── LoRa Radio Section ──
     html += F(
         "<h2>&#x1f4fb; LoRa Radio</h2>"
@@ -775,6 +804,9 @@ static void config_handle_save() {
                     sizeof(firewall_state.mdns_hostname) - 1);
         }
     }
+
+    // ── rnprobe responder ──
+    firewall_state.probe_enabled = (config_server->arg("probe_en").toInt() == 1);
 
     // Save boundary config to EEPROM
     firewall_save_config();

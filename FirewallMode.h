@@ -105,6 +105,7 @@
 #define ADDR_CONF_LT_AL         0x150 // Long-term  airtime limit (1 byte, percent * 10)
 #define ADDR_CONF_MDNS_EN       0x151 // mDNS enable flag (1 byte; 0x73 = enabled, 0xFF = unset/default-enabled)
 #define ADDR_CONF_MDNS_NAME     0x152 // Custom mDNS hostname (33 bytes, null-terminated; empty = auto)
+#define ADDR_CONF_PROBE_EN      0x23C // rnprobe responder enable (1 byte; 0x73 = enabled, 0xFF = unset/disabled)
 // Extra backbone slots 1-3 (slot 0 remains in the legacy BTCP/BHOST/BHPORT
 // fields for backward compatibility with existing devices).
 #define ADDR_CONF_BSLOT_BASE    0x173
@@ -165,6 +166,12 @@ struct FirewallState {
     // the last 4 hex chars of the device MAC.  Validated to RFC-952 plus
     // hyphen/digit at save time.
     char     mdns_hostname[33];
+
+    // rnprobe responder — when enabled, the Transport instance registers a
+    // well-known destination that responds to rnprobe utility probes.
+    // The destination hash is deterministic: hash(transport_identity_hash +
+    // name_hash("rnstransport", "probe")).  Default: disabled.
+    bool     probe_enabled;
 
     // Runtime state
     bool     wifi_connected;
@@ -430,6 +437,12 @@ inline void firewall_load_config() {
     }
     firewall_state.mdns_hostname[32] = '\0';
 
+    // rnprobe responder — disabled by default (0xFF = unset)
+    {
+        uint8_t probe_byte = EEPROM.read(config_addr(ADDR_CONF_PROBE_EN));
+        firewall_state.probe_enabled = (probe_byte == FIREWALL_ENABLE_BYTE);
+    }
+
     // Reset runtime state
     firewall_state.packets_bridged_lora_to_tcp = 0;
     firewall_state.packets_bridged_tcp_to_lora = 0;
@@ -529,6 +542,10 @@ inline void firewall_save_config() {
         EEPROM.write(config_addr(ADDR_CONF_MDNS_NAME + i), firewall_state.mdns_hostname[i]);
     }
     EEPROM.write(config_addr(ADDR_CONF_MDNS_NAME + 32), 0x00);
+
+    // rnprobe responder
+    EEPROM.write(config_addr(ADDR_CONF_PROBE_EN),
+                 firewall_state.probe_enabled ? FIREWALL_ENABLE_BYTE : 0x00);
 
     EEPROM.write(config_addr(ADDR_CONF_APP_MARKER0), FIREWALL_APP_MARKER0);
     EEPROM.write(config_addr(ADDR_CONF_APP_MARKER1), FIREWALL_APP_MARKER1);

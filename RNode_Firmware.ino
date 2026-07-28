@@ -273,6 +273,8 @@ RNS::FileSystem filesystem(RNS::Type::NONE);
 #ifdef FIREWALL_MODE
 // Firewall mode: TCP backbone interface + state
 FirewallState firewall_state = {};
+// Bridge to microReticulum Transport.cpp (avoids header coupling)
+bool firewall_probe_enabled = false;
 RNS::Interface tcp_rns_interfaces[FIREWALL_BACKBONE_SLOTS] = {
   RNS::Interface(RNS::Type::NONE),
   RNS::Interface(RNS::Type::NONE),
@@ -1001,6 +1003,9 @@ void setup() {
       boundary_nominal_path_table_maxsize = RNS::Transport::path_table_maxsize();
       boundary_nominal_path_table_maxpersist = RNS::Transport::probe_destination_enabled();
       firewall_load_config();
+
+      // Bridge probe toggle to Transport (read before Transport::start())
+      firewall_probe_enabled = firewall_state.probe_enabled;
 
       // Set up IFAC on the LoRa interface if configured
       if (firewall_state.ifac_enabled &&
