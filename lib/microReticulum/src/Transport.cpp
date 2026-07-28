@@ -364,6 +364,18 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 	_control_hashes.insert(tunnel_synthesize_destination.hash());
 	DEBUG("Created transport-specific tunnel synthesize destination " + tunnel_synthesize_destination.hash().toHex());
 
+	// Create transport-specific destination for rnprobe responder.
+	// rnprobe sends a random DATA packet and measures RTT from the
+	// delivery proof.  PROVE_ALL makes Transport send that proof
+	// automatically — no custom packet handler needed.
+	// The destination hash is well-known: identity.hash + hash("rnstransport", "probe").
+	Destination probe_destination(Transport::identity(), Type::Destination::IN, Type::Destination::SINGLE, APP_NAME, "probe");
+	probe_destination.accepts_links(false);
+	probe_destination.set_proof_strategy(Type::Destination::PROVE_ALL);
+	_control_destinations.insert(probe_destination);
+	_control_hashes.insert(probe_destination.hash());
+	NOTICE("PROBE-DST: " + probe_destination.hash().toHex().substr(0,8) + " — responding to rnprobe requests");
+
 	_jobs_running = false;
 
 	// CBA Threading
