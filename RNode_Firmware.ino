@@ -992,6 +992,7 @@ void setup() {
       HEAD("Registering LoRA Interface...", RNS::LOG_TRACE);
       lora_interface = new LoRaInterface();
       RNS::Transport::register_interface(lora_interface);
+      RNS::Transport::register_local_client_interface(lora_interface);
 
 #ifdef FIREWALL_MODE
       // ── Firewall Mode: Load config and optionally set up WiFi + TCP ──

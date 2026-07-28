@@ -20,11 +20,6 @@ using namespace RNS;
 using namespace RNS::Type::Transport;
 using namespace RNS::Utilities;
 
-// ── Firewall-mode extern: set by RTNode firmware before Transport::start() ──
-#ifdef FIREWALL_MODE
-extern bool firewall_probe_enabled;
-#endif
-
 // ── Flat-map helpers (vector<pair<Bytes,T>> replaces std::map<Bytes,T>) ────
 // Eliminates per-element tree-node allocation. Linear search is fine
 // for N ≤ ~1000 on ESP32.
@@ -254,6 +249,9 @@ static std::string short_hash(const Bytes& h) {
 static bool is_backbone_interface(const Interface& iface) {
 	return iface.is_backbone();
 }
+static bool is_trusted_local_interface(const Interface& iface) {
+	return iface.is_local_client();
+}
 // Human-readable packet type abbreviations
 static const char* pkt_type_name(uint8_t t) {
 	switch (t) {
@@ -368,24 +366,6 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 	// CBA ACCUMULATES
 	_control_hashes.insert(tunnel_synthesize_destination.hash());
 	DEBUG("Created transport-specific tunnel synthesize destination " + tunnel_synthesize_destination.hash().toHex());
-
-	// Create transport-specific destination for rnprobe responder.
-	// rnprobe sends a random DATA packet and measures RTT from the
-	// delivery proof.  PROVE_ALL makes Transport send that proof
-	// automatically — no custom packet handler needed.
-	// The destination hash is well-known: identity.hash + hash("rnstransport", "probe").
-	// In firewall mode, gated by the captive-portal toggle.
-#ifdef FIREWALL_MODE
-	if (firewall_probe_enabled)
-#endif
-	{
-		Destination probe_destination(Transport::identity(), Type::Destination::IN, Type::Destination::SINGLE, APP_NAME, "probe");
-		probe_destination.accepts_links(false);
-		probe_destination.set_proof_strategy(Type::Destination::PROVE_ALL);
-		_control_destinations.insert(probe_destination);
-		_control_hashes.insert(probe_destination.hash());
-		NOTICE("PROBE-DST: " + probe_destination.hash().toHex().substr(0,8) + " — responding to rnprobe requests");
-	}
 
 	_jobs_running = false;
 
@@ -1624,6 +1604,7 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 #ifdef FIREWALL_MODE
 		{
 			bool is_backbone = is_backbone_interface(packet.receiving_interface());
+			bool is_trusted_local = is_trusted_local_interface(packet.receiving_interface());
 
 			// ── Extract all addresses from this packet ──────────
 			// Two tiers:
@@ -1727,10 +1708,10 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 				for (auto& a : addrs) { wl_add(a, "backbone"); }
 				WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - WL-PASS hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
 			}
-			else {
+			else if (is_trusted_local) {
 				// === LOCAL DEVICE PACKET ===
 				// Always whitelist ALL addresses from local packets.
-				// Local devices are trusted; their traffic seeds the
+				// LoRa and registered TCP server clients are trusted; their traffic seeds the
 				// secondary whitelist for return traffic from WAN.
 				for (auto& a : addrs) { wl_add(a, "local"); }
 				WLOG(packet, "TO: " + short_hash(packet.destination_hash()) + " (" + dest_zone(packet.destination_hash()) + ") - WL-PASS hops=" + std::to_string(packet.hops()) + " sz=" + std::to_string(packet.raw().size()));
@@ -2360,6 +2341,15 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 			if (iter == _destinations.end() && Identity::validate_announce(packet)) {
 #endif
 				TRACE("Transport::inbound: Packet is announce for non-local destination, processing...");
+#ifdef FIREWALL_MODE
+				// A valid announce received from LoRa or the local TCP server proves
+				// that destination is locally reachable. Record it before replay/path
+				// dedup, since the same announce may already have arrived via WAN.
+				if (is_trusted_local_interface(packet.receiving_interface())) {
+					wl1_push(packet.destination_hash());
+					NOTICE("WL#1 ADD - " + packet.destination_hash().toHex().substr(0,8) + " (from LAN)");
+				}
+#endif
 				if (packet.transport_id()) {
 					received_from = packet.transport_id();
 					
@@ -2537,16 +2527,6 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 						DEBUG("Destination " + packet.destination_hash().toHex() + " is now " + std::to_string(announce_hops) + " hops away via " + received_from.toHex() + " on " + packet.receiving_interface().toString());
 						DEBUG("DIAG: STORED path " + packet.destination_hash().toHex().substr(0,8) + " hops=" + std::to_string(announce_hops) + " iface=" + packet.receiving_interface().toString());
 
-						// FIREWALL MODE: Register destinations seen via non-backbone interfaces (Whitelist 1)
-#ifdef FIREWALL_MODE
-						{
-							bool is_backbone = is_backbone_interface(packet.receiving_interface());
-							if (!is_backbone) {
-								wl1_push(packet.destination_hash());
-								NOTICE("WL#1 ADD - " + packet.destination_hash().toHex().substr(0,8) + " (from LAN)");
-							}
-						}
-#endif
 						//TRACE("Transport::inbound: Destination " + packet.destination_hash().toHex() + " has data: " + packet.data().toHex());
 						//TRACE("Transport::inbound: Destination " + packet.destination_hash().toHex() + " has text: " + packet.data().toString());
 
@@ -2946,6 +2926,12 @@ static inline bool is_resource_ctx(uint8_t ctx) {
 	_interfaces.insert({interface.get_hash(), interface});
 #endif
 	// CBA TODO set or add transport as listener on interface to receive incoming packets?
+}
+
+/*static*/ void Transport::register_local_client_interface(Interface& interface) {
+	interface.is_local_client(true);
+	interface.is_backbone(false);
+	TRACE("Transport: Registered trusted local client interface " + interface.toString());
 }
 
 /*static*/ void Transport::deregister_interface(const Interface& interface) {

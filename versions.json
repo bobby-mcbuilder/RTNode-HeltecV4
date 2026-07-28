@@ -1,7 +1,6 @@
 [
-  {
-    "tag": "v1.0.47",
-    "name": "v1.0.47 — LoRa repeater audit: atomic queue, same-interface announce propagation",
+  {    "tag": "v1.0.48",
+    "name": "v1.0.48 — TCP server whitelist parity, LAN announce WL#1 fix",
     "stability": "beta",
     "prerelease": false,
     "published_at": "2026-07-27T00:00:00Z",
@@ -12,8 +11,7 @@
       "rtnode_heltec_v4_merged.bin"
     ]
   },
-  {
-    "tag": "v1.0.46",
+  {    "tag": "v1.0.46",
     "name": "v1.0.46 — Proof timeout fix: extra_link_proof_timeout for LoRa interfaces",
     "stability": "beta",
     "prerelease": false,

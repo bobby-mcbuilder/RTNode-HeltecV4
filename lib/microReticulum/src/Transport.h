@@ -367,7 +367,7 @@ namespace RNS {
 		static void handle_tunnel(const Bytes& tunnel_id, const Interface& interface);
 		static void register_interface(Interface& interface);
 		static void deregister_interface(const Interface& interface);
-		static void register_local_client_interface(const Interface&) { /* no-op in firewall mode */ }
+		static void register_local_client_interface(Interface& interface);
 		inline static const std::map<Bytes, Interface&> get_interfaces() { return _interfaces; }
 		static void register_destination(Destination& destination);
 		static void deregister_destination(const Destination& destination);

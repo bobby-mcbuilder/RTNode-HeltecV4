@@ -90,6 +90,7 @@ namespace RNS {
 		bool _is_connected_to_shared_instance = false;
 		bool _is_local_shared_instance = false;
 		bool _is_backbone = false;
+		bool _is_local_client = false;
 		//Bytes _hash;
 		HInterface _parent_interface;
 		//Transport& _owner;
@@ -212,6 +213,8 @@ namespace RNS {
 		inline bool is_local_shared_instance() const { assert(_impl); return _impl->_is_local_shared_instance; }
 		inline bool is_backbone() const { assert(_impl); return _impl->_is_backbone; }
 		inline void is_backbone(bool val) { assert(_impl); _impl->_is_backbone = val; }
+		inline bool is_local_client() const { assert(_impl); return _impl->_is_local_client; }
+		inline void is_local_client(bool val) { assert(_impl); _impl->_is_local_client = val; }
 		inline bool isConnected() const { assert(_impl); return _impl->isConnected(); }
 		inline HInterface parent_interface() const { assert(_impl); return _impl->_parent_interface; }
 
