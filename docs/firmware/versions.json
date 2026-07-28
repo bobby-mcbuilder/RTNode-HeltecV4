@@ -1,5 +1,18 @@
 [
   {
+    "tag": "v1.0.48",
+    "name": "v1.0.48 \u2014 TCP server whitelist parity, LAN announce WL#1 fix",
+    "stability": "beta",
+    "prerelease": false,
+    "published_at": "2026-07-27T00:00:00Z",
+    "assets": [
+      "rtnode_heltec_v3.bin",
+      "rtnode_heltec_v3_merged.bin",
+      "rtnode_heltec_v4.bin",
+      "rtnode_heltec_v4_merged.bin"
+    ]
+  },
+  {
     "tag": "v1.0.47",
     "name": "v1.0.47 \u2014 LoRa repeater audit: atomic queue, same-interface announce propagation",
     "stability": "beta",
