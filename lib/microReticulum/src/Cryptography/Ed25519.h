@@ -36,6 +36,9 @@ namespace RNS { namespace Cryptography {
 		}
 
 		inline bool verify(const Bytes& signature, const Bytes& message) {
+			if (signature.size() != 64 || _publicKey.size() != 32) {
+				return false;
+			}
 			return Ed25519::verify(signature.data(), _publicKey.data(), message.data(), message.size());
 		}
 

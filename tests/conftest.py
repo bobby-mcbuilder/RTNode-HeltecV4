@@ -75,6 +75,17 @@ def pytest_addoption(parser):
         help="Serial baud rate (default: 115200)",
     )
     parser.addoption(
+        "--rtnode-host",
+        default="mynode.local",
+        help="RTNode TCP server hostname (default: mynode.local)",
+    )
+    parser.addoption(
+        "--rtnode-tcp-port",
+        default=4242,
+        type=int,
+        help="RTNode TCP server port (default: 4242)",
+    )
+    parser.addoption(
         "--rx-timeout",
         default=15.0,
         type=float,
@@ -167,6 +178,14 @@ def rnode_port(request) -> str | None:
 @pytest.fixture(scope="session")
 def baud(request) -> int:
     return request.config.getoption("--baud")
+
+
+@pytest.fixture(scope="session")
+def rtnode_tcp_endpoint(request) -> tuple[str, int]:
+    return (
+        request.config.getoption("--rtnode-host"),
+        request.config.getoption("--rtnode-tcp-port"),
+    )
 
 
 @pytest.fixture(scope="session")

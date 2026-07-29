@@ -29,6 +29,7 @@
 #define NODE_HASH_RTC_MAGIC  0x504B4841UL
 extern uint32_t rtc_node_hash_magic;
 extern char     rtc_node_hash_hex[33];
+extern char     rtc_probe_hash_hex[21];
 
 #define BOUNDARY_RESET_REPORT_MAGIC    0x42525054UL
 #define BOUNDARY_RESET_REPORT_VERSION  1
@@ -388,14 +389,13 @@ static void config_send_html() {
     html += F("</select>");
 
     html += F("<div class='node-hash' style='margin-top:8px;'><span class='nh-label'>&#x1f4e8; Probe Destination</span><code>");
-    if (rtc_node_hash_magic == NODE_HASH_RTC_MAGIC && rtc_node_hash_hex[0] != '\\0') {
-        html += String(rtc_node_hash_hex);
-        html += F(".rnstransport.probe");
+    if (rtc_node_hash_magic == NODE_HASH_RTC_MAGIC && rtc_probe_hash_hex[0] != '\0') {
+        html += String(rtc_probe_hash_hex);
     } else {
         html += F("<span style='color:#888;font-style:italic;'>Available after first normal boot</span>");
     }
     html += F("</code></div>");
-    html += F("<p class='note'>Run: <code>rnprobe &lt;hash&gt;.rnstransport.probe &lt;hash&gt;</code> "
+    html += F("<p class='note'>Run: <code>rnprobe rnstransport.probe &lt;hash&gt;</code> "
               "from any reachable Reticulum node.  The hash is also printed in the serial log "
               "as <code>PROBE-DST</code> at boot.</p>");
 

@@ -45,6 +45,18 @@
 #define HDLC_ESC   0x7D
 #define HDLC_ESC_MASK 0x20
 
+#define KISS_FEND      0xC0
+#define KISS_FESC      0xDB
+#define KISS_TFEND     0xDC
+#define KISS_TFESC     0xDD
+#define KISS_CMD_DATA  0x00
+
+enum TcpFraming {
+    TCP_FRAMING_AUTO = 0,
+    TCP_FRAMING_HDLC,
+    TCP_FRAMING_KISS,
+};
+
 // ─── TCP Interface Mode ──────────────────────────────────────────────────────
 enum TcpIfMode {
     TCP_IF_MODE_SERVER = 0,  // Listen for incoming connections (from backbone rnsd)
@@ -56,10 +68,11 @@ struct TcpClient {
     WiFiClient client;
     uint32_t   last_activity;
     bool       active;
-    // HDLC deframe state
+    TcpFraming framing;
     bool       in_frame;
     bool       escape;
     bool       truncated;
+    uint8_t    kiss_command;
     uint8_t    rxbuf[TCP_IF_HW_MTU];
     uint16_t   rxlen;
 };
@@ -104,9 +117,11 @@ public:
         }
         for (int i = 0; i < TCP_IF_MAX_CLIENTS; i++) {
             _clients[i].active = false;
+            _clients[i].framing = TCP_FRAMING_AUTO;
             _clients[i].in_frame = false;
             _clients[i].escape = false;
             _clients[i].truncated = false;
+            _clients[i].kiss_command = 0xFF;
             _clients[i].rxlen = 0;
             _clients[i].last_activity = 0;
         }
@@ -193,10 +208,12 @@ public:
             uint32_t now = millis();
             if (now - _last_keepalive >= TCP_IF_KEEPALIVE_INTERVAL) {
                 _last_keepalive = now;
-                uint8_t ka[] = { HDLC_FLAG, HDLC_FLAG };
                 for (int i = 0; i < TCP_IF_MAX_CLIENTS; i++) {
                     if (_clients[i].active && _clients[i].client.connected()) {
-                        size_t written = _clients[i].client.write(ka, 2);
+                        if (_clients[i].framing == TCP_FRAMING_AUTO) continue;
+                        uint8_t delimiter = _clients[i].framing == TCP_FRAMING_KISS ? KISS_FEND : HDLC_FLAG;
+                        uint8_t keepalive[] = { delimiter, delimiter };
+                        size_t written = _clients[i].client.write(keepalive, 2);
                         if (written == 0) {
                             _cleanup_client(i, "keepalive write failed");
                         }
@@ -242,7 +259,7 @@ protected:
     virtual void send_outgoing(const RNS::Bytes& data) override {
         if (!_started || _num_clients == 0) return;
 
-        // HDLC frame the data.  Use a static buffer (BSS, not stack) to avoid
+        // Frame the data. Use a static buffer (BSS, not stack) to avoid
         // "Stack canary watchpoint" crashes in deep call chains.  The frame can
         // be up to 2x the input size (every byte escaped) + 2 FLAG delimiters.
         // Single-threaded context (loopTask) so static is safe across all
@@ -251,28 +268,35 @@ protected:
         static uint8_t frame_buf[frame_cap];
         uint16_t flen = 0;
 
-        frame_buf[flen++] = HDLC_FLAG;
-        for (size_t i = 0; i < data.size(); i++) {
-            uint8_t b = data.data()[i];
-            if (b == HDLC_FLAG || b == HDLC_ESC) {
-                frame_buf[flen++] = HDLC_ESC;
-                frame_buf[flen++] = b ^ HDLC_ESC_MASK;
-            } else {
-                frame_buf[flen++] = b;
-            }
-            if (flen >= frame_cap - 4) break; // safety — truncate rather than overflow
-        }
-        frame_buf[flen++] = HDLC_FLAG;
-
-        // Send to all connected clients EXCEPT the one that sent this packet.
-        // v1.0.10: Echo prevention — if this send_outgoing was triggered by
-        // Transport forwarding a packet received from client N, skip client N
-        // to prevent echo-back that floods TCP buffers and stalls resource transfers.
+        // Suppress only a byte-for-byte echo to the source client. Distinct
+        // packets generated synchronously in response (path announces, proofs,
+        // etc.) must be returned on that same connection.
         for (int i = 0; i < TCP_IF_MAX_CLIENTS; i++) {
-            if (i == _last_rx_client_idx) {
-                continue;  // Don't echo back to sender
+            if (i == _last_rx_client_idx && data == _last_rx_data) {
+                continue;
             }
             if (_clients[i].active && _clients[i].client.connected()) {
+                TcpFraming framing = _clients[i].framing;
+                if (framing == TCP_FRAMING_AUTO) continue;
+
+                flen = 0;
+                uint8_t delimiter = framing == TCP_FRAMING_KISS ? KISS_FEND : HDLC_FLAG;
+                frame_buf[flen++] = delimiter;
+                if (framing == TCP_FRAMING_KISS) frame_buf[flen++] = KISS_CMD_DATA;
+                for (size_t offset = 0; offset < data.size(); offset++) {
+                    uint8_t byte = data.data()[offset];
+                    if (framing == TCP_FRAMING_KISS && (byte == KISS_FEND || byte == KISS_FESC)) {
+                        frame_buf[flen++] = KISS_FESC;
+                        frame_buf[flen++] = byte == KISS_FEND ? KISS_TFEND : KISS_TFESC;
+                    } else if (framing == TCP_FRAMING_HDLC && (byte == HDLC_FLAG || byte == HDLC_ESC)) {
+                        frame_buf[flen++] = HDLC_ESC;
+                        frame_buf[flen++] = byte ^ HDLC_ESC_MASK;
+                    } else {
+                        frame_buf[flen++] = byte;
+                    }
+                    if (flen >= frame_cap - 4) break;
+                }
+                frame_buf[flen++] = delimiter;
                 size_t written = _clients[i].client.write(frame_buf, flen);
                 if (written == 0) {
                     _cleanup_client(i, "write failed");
@@ -313,9 +337,11 @@ private:
         c.client.stop();
         c.client = WiFiClient();  // Release any residual shared_ptr state
         c.active = false;
+        c.framing = TCP_FRAMING_AUTO;
         c.in_frame = false;
         c.escape = false;
         c.truncated = false;
+        c.kiss_command = 0xFF;
         c.rxlen = 0;
         _num_clients--;
 
@@ -325,9 +351,71 @@ private:
                       (int)(heap_after - heap_before));
     }
 
-    // ─── HDLC byte-level deframing ──────────────────────────────────────────
+    void _deliver_frame(int idx) {
+        TcpClient& c = _clients[idx];
+        RNS::Bytes data(c.rxbuf, c.rxlen);
+        _last_rx_client_idx = idx;
+        _last_rx_data = data;
+        handle_incoming(data);
+        _last_rx_data.clear();
+        _last_rx_client_idx = -1;
+    }
+
+    // ─── HDLC/KISS byte-level deframing ─────────────────────────────────────
     void _hdlc_deframe(int idx, uint8_t byte) {
         TcpClient& c = _clients[idx];
+
+        if (c.framing == TCP_FRAMING_AUTO) {
+            if (byte == HDLC_FLAG) {
+                c.framing = TCP_FRAMING_HDLC;
+                Serial.printf("[TcpIF] Client %d framing: HDLC\r\n", idx);
+            } else if (byte == KISS_FEND) {
+                c.framing = TCP_FRAMING_KISS;
+                Serial.printf("[TcpIF] Client %d framing: KISS\r\n", idx);
+            } else {
+                return;
+            }
+            c.in_frame = true;
+            c.escape = false;
+            c.truncated = false;
+            c.kiss_command = 0xFF;
+            c.rxlen = 0;
+            return;
+        }
+
+        if (c.framing == TCP_FRAMING_KISS) {
+            if (byte == KISS_FEND) {
+                if (c.in_frame && c.kiss_command == KISS_CMD_DATA && c.rxlen > 0 && !c.truncated) {
+                    _deliver_frame(idx);
+                } else if (c.truncated) {
+                    Serial.printf("[TcpIF] DROPPED oversized KISS frame from client %d (>%d bytes)\r\n",
+                                  idx, TCP_IF_HW_MTU);
+                }
+                c.in_frame = true;
+                c.escape = false;
+                c.truncated = false;
+                c.kiss_command = 0xFF;
+                c.rxlen = 0;
+                return;
+            }
+            if (!c.in_frame) return;
+            if (c.kiss_command == 0xFF) {
+                c.kiss_command = byte & 0x0F;
+                return;
+            }
+            if (c.kiss_command != KISS_CMD_DATA) return;
+            if (c.escape) {
+                if (byte == KISS_TFEND) byte = KISS_FEND;
+                else if (byte == KISS_TFESC) byte = KISS_FESC;
+                c.escape = false;
+            } else if (byte == KISS_FESC) {
+                c.escape = true;
+                return;
+            }
+            if (c.rxlen < TCP_IF_HW_MTU) c.rxbuf[c.rxlen++] = byte;
+            else c.truncated = true;
+            return;
+        }
 
         if (byte == HDLC_FLAG) {
             if (c.in_frame && c.rxlen > 0) {
@@ -344,10 +432,7 @@ private:
                     // skip echoing this packet back to the client that sent it.
                     // The entire call chain (handle_incoming → Transport::inbound
                     // → transmit → send_outgoing) is synchronous, so this is safe.
-                    RNS::Bytes data(c.rxbuf, c.rxlen);
-                    _last_rx_client_idx = idx;
-                    handle_incoming(data);
-                    _last_rx_client_idx = -1;
+                    _deliver_frame(idx);
                     c.rxlen = 0;
                 }
             }
@@ -397,9 +482,11 @@ private:
                 _clients[i].client.setNoDelay(true);
                 _clients[i].client.setTimeout(TCP_IF_WRITE_TIMEOUT / 1000);
                 _clients[i].active = true;
+                _clients[i].framing = TCP_FRAMING_AUTO;
                 _clients[i].in_frame = false;
                 _clients[i].escape = false;
                 _clients[i].truncated = false;
+                _clients[i].kiss_command = 0xFF;
                 _clients[i].rxlen = 0;
                 _clients[i].last_activity = millis();
                 _num_clients++;
@@ -467,9 +554,11 @@ private:
             }
             _clients[0].client = client;
             _clients[0].active = true;
+            _clients[0].framing = TCP_FRAMING_HDLC;
             _clients[0].in_frame = false;
             _clients[0].escape = false;
             _clients[0].truncated = false;
+            _clients[0].kiss_command = 0xFF;
             _clients[0].rxlen = 0;
             _clients[0].last_activity = millis();
             _num_clients = 1;
@@ -514,6 +603,7 @@ private:
     uint16_t    _consecutive_failures;
     bool        _started;
     int         _last_rx_client_idx = -1;  // v1.0.10: echo prevention — tracks which client is currently delivering an inbound frame
+    RNS::Bytes  _last_rx_data;
 };
 
 #endif // FIREWALL_MODE

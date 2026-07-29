@@ -308,6 +308,7 @@ RTC_NOINIT_ATTR uint32_t bootloop_first_boot_ms;
 #define NODE_HASH_RTC_MAGIC  0x504B4841UL  // "PKHA"
 RTC_NOINIT_ATTR uint32_t rtc_node_hash_magic;
 RTC_NOINIT_ATTR char     rtc_node_hash_hex[33];  // 32 hex chars + NUL
+RTC_NOINIT_ATTR char     rtc_probe_hash_hex[21]; // 20 hex chars + NUL
 
 RTC_NOINIT_ATTR BoundaryResetReport boundary_reset_report;
 
@@ -1188,15 +1189,22 @@ void setup() {
       RNS::Destination destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "rnstransport", "local");
 
 #ifdef FIREWALL_MODE
-      // Cache this node's destination hash in RTC memory so the captive-portal
-      // config page can show it without needing RNS to be running.
+      // Cache this node's identity and probe destination hashes in RTC memory
+      // so the captive-portal config page can show them without RNS running.
       {
-        std::string h = destination.hash().toHex();
+        std::string h = RNS::Transport::identity().hash().toHex();
         size_t len = h.length();
         if (len > 32) len = 32;
         memcpy(rtc_node_hash_hex, h.c_str(), len);
         rtc_node_hash_hex[len] = '\0';
         rtc_node_hash_magic = NODE_HASH_RTC_MAGIC;
+
+        RNS::Bytes probe_hash = RNS::Destination::hash(RNS::Transport::identity(), "rnstransport", "probe");
+        std::string ph = probe_hash.toHex();
+        size_t ph_len = ph.length();
+        if (ph_len > 20) ph_len = 20;
+        memcpy(rtc_probe_hash_hex, ph.c_str(), ph_len);
+        rtc_probe_hash_hex[ph_len] = '\0';
       }
 
       // Initialise the Reticulum interface-discovery announcer. Per the

@@ -380,6 +380,12 @@ Recall last heard app_data for a destination hash.
 /*static*/ bool Identity::validate_announce(const Packet& packet) {
 	try {
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
+			const size_t fixed_data_size = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8;
+			if (packet.data().size() < fixed_data_size) {
+				WARNING("Received malformed announce with " + std::to_string(packet.data().size()) +
+					" data bytes; expected at least " + std::to_string(fixed_data_size));
+				return false;
+			}
 			Bytes destination_hash = packet.destination_hash();
 			//TRACE("Identity::validate_announce: destination_hash: " + packet.destination_hash().toHex());
 			Bytes public_key = packet.data().left(KEYSIZE/8);
@@ -391,8 +397,8 @@ Recall last heard app_data for a destination hash.
 			Bytes signature = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8, SIGLENGTH/8);
 			//TRACE("Identity::validate_announce: signature:        " + signature.toHex());
 			Bytes app_data;
-			if (packet.data().size() > (KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8)) {
-				app_data = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8);
+			if (packet.data().size() > fixed_data_size) {
+				app_data = packet.data().mid(fixed_data_size);
 			}
 			//TRACE("Identity::validate_announce: app_data:         " + app_data.toHex());
 			//TRACE("Identity::validate_announce: app_data text:    " + app_data.toString());
@@ -401,7 +407,7 @@ Recall last heard app_data for a destination hash.
 			signed_data << packet.destination_hash() << public_key << name_hash << random_hash+app_data;
 			//TRACE("Identity::validate_announce: signed_data:      " + signed_data.toHex());
 
-			if (packet.data().size() <= KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8) {
+			if (packet.data().size() <= fixed_data_size) {
 				app_data.clear();
 			}
 
@@ -607,11 +613,10 @@ Validates the signature of a signed message.
 */
 bool Identity::validate(const Bytes& signature, const Bytes& message) const {
 	assert(_object);
-	if (_object->_pub) {
+	if (_object->_pub && _object->_sig_pub) {
 		try {
 			TRACE("Identity::validate: Attempting to verify signature: " + signature.toHex() + " and message: " + message.toHex());
-			_object->_sig_pub->verify(signature, message);
-			return true;
+			return _object->_sig_pub->verify(signature, message);
 		}
 		catch (std::exception& e) {
 			return false;
