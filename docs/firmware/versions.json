@@ -1,5 +1,18 @@
 [
   {
+    "tag": "v1.0.50",
+    "name": "v1.0.50 \u2014 Ratcheted announce validation, HDLC/KISS dual framing, Ed25519 hardening, TCP echo fix, rnprobe corrections",
+    "stability": "beta",
+    "prerelease": false,
+    "published_at": "2026-07-28T00:00:00Z",
+    "assets": [
+      "rtnode_heltec_v3.bin",
+      "rtnode_heltec_v3_merged.bin",
+      "rtnode_heltec_v4.bin",
+      "rtnode_heltec_v4_merged.bin"
+    ]
+  },
+  {
     "tag": "v1.0.49",
     "name": "v1.0.49 \u2014 HDLC/KISS dual framing, malformed announce panic fix, TCP echo fix, rnprobe corrections",
     "stability": "beta",
