@@ -380,7 +380,11 @@ Recall last heard app_data for a destination hash.
 /*static*/ bool Identity::validate_announce(const Packet& packet) {
 	try {
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
-			const size_t fixed_data_size = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8;
+			const bool has_ratchet = packet.context_flag() == Type::Packet::FLAG_SET;
+			const size_t ratchet_size = has_ratchet ? RATCHETSIZE/8 : 0;
+			const size_t ratchet_offset = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8;
+			const size_t signature_offset = ratchet_offset + ratchet_size;
+			const size_t fixed_data_size = signature_offset + SIGLENGTH/8;
 			if (packet.data().size() < fixed_data_size) {
 				WARNING("Received malformed announce with " + std::to_string(packet.data().size()) +
 					" data bytes; expected at least " + std::to_string(fixed_data_size));
@@ -394,7 +398,11 @@ Recall last heard app_data for a destination hash.
 			//TRACE("Identity::validate_announce: name_hash:        " + name_hash.toHex());
 			Bytes random_hash = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8, RANDOM_HASH_LENGTH/8);
 			//TRACE("Identity::validate_announce: random_hash:      " + random_hash.toHex());
-			Bytes signature = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8, SIGLENGTH/8);
+			Bytes ratchet;
+			if (has_ratchet) {
+				ratchet = packet.data().mid(ratchet_offset, ratchet_size);
+			}
+			Bytes signature = packet.data().mid(signature_offset, SIGLENGTH/8);
 			//TRACE("Identity::validate_announce: signature:        " + signature.toHex());
 			Bytes app_data;
 			if (packet.data().size() > fixed_data_size) {
@@ -404,7 +412,7 @@ Recall last heard app_data for a destination hash.
 			//TRACE("Identity::validate_announce: app_data text:    " + app_data.toString());
 
 			Bytes signed_data;
-			signed_data << packet.destination_hash() << public_key << name_hash << random_hash+app_data;
+			signed_data << packet.destination_hash() << public_key << name_hash << random_hash << ratchet << app_data;
 			//TRACE("Identity::validate_announce: signed_data:      " + signed_data.toHex());
 
 			if (packet.data().size() <= fixed_data_size) {
